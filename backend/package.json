@@ -1,0 +1,17 @@
+{
+  "name": "netshare-relay-wg",
+  "version": "1.0.0",
+  "description": "NetShare relay server — WireGuard + VPS edition",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev":   "node --watch server.js",
+    "pm2":   "pm2 start server.js --name netshare-relay"
+  },
+  "dependencies": {
+    "cors":    "^2.8.5",
+    "express": "^4.19.2",
+    "ws":      "^8.18.0"
+  }
+}
