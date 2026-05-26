@@ -1,0 +1,363 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Accept Android SDK licenses
+        run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install required Android SDK components
+        run: |
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('frontend/android/**/*.gradle*') }}
+          restore-keys: gradle-
+
+      - name: Install Node dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Set up Android SDK local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      # ── Force-write Gradle files (overrides repo versions to ensure correctness) ──
+
+      - name: Write root build.gradle
+        run: |
+          cat > android/build.gradle << 'EOF'
+          buildscript {
+              ext {
+                  buildToolsVersion = "34.0.0"
+                  minSdkVersion = 24
+                  compileSdkVersion = 34
+                  targetSdkVersion = 34
+              }
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath("com.android.tools.build:gradle:8.3.2")
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  // React Native 0.74 local maven (built by npm install)
+                  maven { url "$rootDir/../node_modules/react-native/android" }
+                  // React Native dependencies
+                  maven { url "$rootDir/../node_modules/jsc-android/dist" }
+              }
+          }
+
+          task clean(type: Delete) {
+              delete rootProject.buildDir
+          }
+          EOF
+
+      - name: Write app/build.gradle
+        run: |
+          cat > android/app/build.gradle << 'EOF'
+          apply plugin: 'com.android.application'
+
+          android {
+              compileSdk 34
+              namespace "com.netshare"
+
+              defaultConfig {
+                  applicationId "com.netshare"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  debug {
+                      debuggable true
+                  }
+                  release {
+                      minifyEnabled false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              // React Native 0.74.2
+              implementation "com.facebook.react:react-android:0.74.2"
+              implementation "com.facebook.react:hermes-android:0.74.2"
+
+              // AndroidX
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core-ktx:1.12.0'
+
+              // WebSocket for VPS relay
+              implementation 'org.java-websocket:Java-WebSocket:1.5.4'
+
+              // JSON
+              implementation 'com.google.code.gson:gson:2.10.1'
+          }
+          EOF
+
+      - name: Create gradle.properties if missing
+        run: |
+          if [ ! -f android/gradle.properties ]; then
+            cat > android/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+            echo "Created gradle.properties"
+          fi
+
+      - name: Create settings.gradle if missing
+        run: |
+          if [ ! -f android/settings.gradle ]; then
+            cat > android/settings.gradle << 'EOF'
+          rootProject.name = 'NshareApp'
+          include ':app'
+          EOF
+            echo "Created settings.gradle"
+          fi
+
+      # ── Fix NetShareVpnService.java concat bug (force-overwrite) ──────────
+      # concat() only accepts 2 args. The original call passes 5, causing a
+      # compile error. Fix: nest the calls: concat(a, concat(b, concat(c, concat(d, e))))
+
+      - name: Fix NetShareVpnService.java concat bug
+        run: |
+          FILE="android/app/src/main/java/netshare/NetShareVpnService.java"
+          if [ -f "$FILE" ]; then
+            python3 - "$FILE" << 'PYEOF'
+          import sys
+
+          path = sys.argv[1]
+          with open(path, 'r') as f:
+              content = f.read()
+
+          old = """            byte[] mac1    = blake2sMac(mac1Key, concat(
+                      new byte[]{ MSG_INITIATION, 0, 0, 0 },
+                      intToBytes(localIndex), ePubEnc, encS, encTs
+                  ));"""
+
+          new = """            byte[] mac1    = blake2sMac(mac1Key, concat(
+                      new byte[]{ MSG_INITIATION, 0, 0, 0 },
+                      concat(intToBytes(localIndex), concat(ePubEnc, concat(encS, encTs)))
+                  ));"""
+
+          # Try exact match first
+          if old in content:
+              content = content.replace(old, new)
+              print("Fixed: nested concat call patched")
+          else:
+              # Fallback: regex for whitespace-insensitive match
+              import re
+              pattern = r'(blake2sMac\(mac1Key,\s*concat\(\s*new byte\[\]\{\s*MSG_INITIATION,\s*0,\s*0,\s*0\s*\},\s*)intToBytes\(localIndex\),\s*ePubEnc,\s*encS,\s*encTs(\s*\)\))'
+              replacement = r'\1concat(intToBytes(localIndex), concat(ePubEnc, concat(encS, encTs)))\2'
+              new_content, n = re.subn(pattern, replacement, content, flags=re.DOTALL)
+              if n:
+                  content = new_content
+                  print(f"Fixed via regex: {n} replacement(s)")
+              else:
+                  print("WARNING: concat pattern not found - may already be fixed or file differs")
+
+          with open(path, 'w') as f:
+              f.write(content)
+          PYEOF
+          else
+            echo "NetShareVpnService.java not found at $FILE - skipping patch"
+          fi
+
+      # ── Scaffold remaining missing files ──────────────────────────────────
+
+      - name: Create app/src/main folder structure if missing
+        run: |
+          mkdir -p android/app/src/main/java/com/netshare
+          mkdir -p android/app/src/main/res/values
+
+      - name: Create AndroidManifest.xml if missing
+        run: |
+          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
+            cat > android/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+              <application
+                  android:label="NShare"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".NetShareVpnService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+            echo "Created AndroidManifest.xml"
+          fi
+
+      - name: Create strings.xml if missing
+        run: |
+          if [ ! -f android/app/src/main/res/values/strings.xml ]; then
+            cat > android/app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NShare</string>
+          </resources>
+          EOF
+          fi
+
+      - name: Create styles.xml if missing
+        run: |
+          if [ ! -f android/app/src/main/res/values/styles.xml ]; then
+            cat > android/app/src/main/res/values/styles.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
+              </style>
+          </resources>
+          EOF
+          fi
+
+      - name: Create proguard-rules.pro if missing
+        run: |
+          if [ ! -f android/app/proguard-rules.pro ]; then
+            echo "# NShare" > android/app/proguard-rules.pro
+            echo "-keep class com.facebook.react.** { *; }" >> android/app/proguard-rules.pro
+            echo "-keep class org.java_websocket.** { *; }" >> android/app/proguard-rules.pro
+            echo "-keep class com.google.gson.** { *; }" >> android/app/proguard-rules.pro
+          fi
+
+      # ── Generate Gradle wrapper ────────────────────────────────────────────
+
+      - name: Create gradle wrapper properties
+        run: |
+          mkdir -p android/gradle/wrapper
+          cat > android/gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.6-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+      - name: Generate gradlew script
+        run: |
+          if [ ! -f android/gradlew ]; then
+            gradle wrapper --gradle-version=8.6 --project-dir=android
+          fi
+
+      - name: Grant Gradle execute permission
+        run: chmod +x android/gradlew
+
+      # ── Bundle JS & Build ─────────────────────────────────────────────────
+
+      - name: Create metro.config.js if missing
+        run: |
+          if [ ! -f metro.config.js ]; then
+            cat > metro.config.js << 'EOF'
+          const {getDefaultConfig, mergeConfig} = require('@react-native/metro-config');
+          const config = {};
+          module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+          EOF
+            echo "Created metro.config.js"
+          fi
+
+      - name: Create babel.config.js if missing
+        run: |
+          if [ ! -f babel.config.js ]; then
+            cat > babel.config.js << 'EOF'
+          module.exports = {
+            presets: ['module:@react-native/babel-preset'],
+          };
+          EOF
+            echo "Created babel.config.js"
+          fi
+
+      - name: Bundle React Native JS
+        run: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+
+      - name: Build Debug APK
+        run: cd android && ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m'
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nshare-debug-apk
+          path: frontend/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
