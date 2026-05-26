@@ -27,5 +27,5 @@ jobs:
              git pull origin main && \
              npm install && \
              pm2 restart netshare-relay || \
-             pm2 start index.js --name netshare-relay && \
+             pm2 start server.js --name netshare-relay && \
              pm2 save"
