@@ -53,18 +53,6 @@ jobs:
       - name: Set up Android SDK local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
 
-      # ── Download WireGuard tunnel AAR from official GitHub releases ────────
-      # wireguard-android is NOT on Maven Central or JitPack.
-      # The official release publishes a pre-built tunnel AAR on GitHub Releases.
-
-      - name: Download WireGuard tunnel AAR
-        run: |
-          mkdir -p android/app/libs
-          curl -L \
-            "https://github.com/WireGuard/wireguard-android/releases/download/1.0.20230105/tunnel-release.aar" \
-            -o android/app/libs/wireguard-tunnel.aar
-          echo "Downloaded WireGuard tunnel AAR: $(du -sh android/app/libs/wireguard-tunnel.aar)"
-
       # ── Scaffold missing Gradle project files ──────────────────────────────
 
       - name: Create settings.gradle if missing
@@ -157,17 +145,17 @@ jobs:
           }
 
           dependencies {
-              // WireGuard tunnel AAR (downloaded from official GitHub Releases)
-              implementation fileTree(dir: 'libs', include: ['*.aar'])
-
               // AndroidX core
               implementation 'androidx.appcompat:appcompat:1.6.1'
               implementation 'androidx.core:core-ktx:1.12.0'
 
               // WebSocket for VPS relay communication
+              // The app uses Android's built-in VpnService + WebSocket to relay
+              // traffic to the VPS. The VPS runs WireGuard — no Android WireGuard
+              // library is needed or available as a Maven artifact.
               implementation 'org.java-websocket:Java-WebSocket:1.5.4'
 
-              // JSON parsing
+              // JSON parsing (for VPS config/control messages)
               implementation 'com.google.code.gson:gson:2.10.1'
           }
           EOF
@@ -186,7 +174,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-              <!-- WireGuard / VPN permissions -->
+              <!-- VPN / internet sharing permissions -->
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -209,7 +197,7 @@ jobs:
                       </intent-filter>
                   </activity>
 
-                  <!-- WireGuard VPN Service -->
+                  <!-- VPN relay service -->
                   <service
                       android:name=".WireGuardVpnService"
                       android:exported="false"
@@ -289,8 +277,12 @@ jobs:
           import android.os.IBinder;
 
           /**
-           * WireGuard-based VPN service for NShare internet sharing.
-           * Routes traffic through a VPS relay over WireGuard tunnel.
+           * NShare VPN relay service.
+           *
+           * Architecture: This service uses Android's built-in VpnService to create
+           * a TUN interface on the device, then forwards packets to the VPS relay
+           * over a WebSocket connection. The VPS handles WireGuard and internet routing.
+           * No WireGuard Android library is required on the client side.
            */
           public class WireGuardVpnService extends VpnService {
 
@@ -338,9 +330,9 @@ jobs:
       - name: Create proguard-rules.pro if missing
         run: |
           if [ ! -f android/app/proguard-rules.pro ]; then
-            echo "# WireGuard" > android/app/proguard-rules.pro
-            echo "-keep class com.wireguard.** { *; }" >> android/app/proguard-rules.pro
+            echo "# NShare VPN" > android/app/proguard-rules.pro
             echo "-keep class org.java_websocket.** { *; }" >> android/app/proguard-rules.pro
+            echo "-keep class com.google.gson.** { *; }" >> android/app/proguard-rules.pro
           fi
 
       # ── Generate Gradle wrapper ────────────────────────────────────────────
