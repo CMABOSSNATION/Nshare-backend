@@ -23,7 +23,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
         run: |
           ssh -i ~/.ssh/deploy_key $SSH_USER@$SSH_HOST \
-            "cd /opt/netshare-relay && \
+            "cd /opt/netshare-relay/backend && \
              git pull origin main && \
              npm install && \
              pm2 restart netshare-relay || \
