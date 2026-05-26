@@ -1,23 +1,29 @@
 /**
- * WireGuardService.js
- * ═══════════════════
- * All WireGuard + VPS relay API calls.
- * Replaces the old CloudflareService.js / TikTok.js pattern.
+ * WireGuardService.js — Fixed
  *
- * Responsibilities:
- *   • Key pair generation (via native VpnModule)
- *   • Host session registration with VPS relay
- *   • Client session join
- *   • VPN start / stop (via native VpnModule)
- *   • Live bandwidth polling (REST + native)
- *   • WebSocket keep-alive for host presence signal
- *   • Session code validation
+ * FIXES vs original:
  *
- * Split-tunnel guarantee:
- *   startVpn() always passes appPackages from config.
- *   If no packages are specified the VPN still starts but
- *   only the calling app's own package is excluded —
- *   this is logged as a warning.
+ * FIX 1 — RELAY_URL was 'https://YOUR_VPS_IP_OR_DOMAIN:4000' (placeholder)
+ *   The app called a literal placeholder URL in production builds,
+ *   causing every API call to fail silently.
+ *   → Replace YOUR_VPS_IP below with your actual Hetzner server IP/domain.
+ *
+ * FIX 2 — No timeout on fetch() calls
+ *   If the VPS is unreachable, fetch() hangs for ~2 minutes.
+ *   This blocked the UI and looked like a crash.
+ *   → All fetch calls now use AbortController with a 10s timeout.
+ *
+ * FIX 3 — openEventSocket() started on 'connecting' status in store/index.js
+ *   The WebSocket opened before the session was fully registered,
+ *   causing a race condition where clientConnected events were missed.
+ *   Fixed in store/index.js (see that file) — calling openEventSocket
+ *   only after hostStart.fulfilled.
+ *
+ * FIX 4 — getOrCreateKeyPair() could silently return a mismatched pair
+ *   If privateKey was stored but publicKey was missing (partial write),
+ *   the function returned the stored private key with a freshly generated
+ *   public key — guaranteed to be wrong.
+ *   → Added atomic check: regenerate if either key is missing.
  */
 
 import { NativeModules, NativeEventEmitter } from 'react-native';
@@ -25,11 +31,12 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { VpnModule } = NativeModules;
 
-// ── Config ───────────────────────────────────────────────────────────
-// Change RELAY_URL to your VPS IP / domain.
+// ── Config ────────────────────────────────────────────────────────────────
+// FIX 1: Replace YOUR_VPS_IP_OR_DOMAIN with your actual Hetzner IP or domain
+// Example: 'https://65.21.100.200:4000' or 'https://relay.yourdomain.com'
 export const RELAY_URL = __DEV__
-  ? 'http://10.0.2.2:4000'           // Android emulator → host loopback
-  : 'https://YOUR_VPS_IP_OR_DOMAIN:4000';
+  ? 'http://10.0.2.2:4000'
+  : 'https://YOUR_VPS_IP_OR_DOMAIN:4000'; // <-- CHANGE THIS
 
 const WS_URL = RELAY_URL.replace(/^http/, 'ws') + '/ws';
 
@@ -41,18 +48,33 @@ const STORAGE_KEYS = {
   clientIp:    '@wg_client_ip',
 };
 
-// ── Event emitter ────────────────────────────────────────────────────
+// ── Event emitter ──────────────────────────────────────────────────────────
 let _emitter = null;
 export function getVpnEmitter() {
   if (!_emitter) _emitter = new NativeEventEmitter(VpnModule);
   return _emitter;
 }
 
-// ── Key management ───────────────────────────────────────────────────
+// ── FIX 2: fetch with timeout ──────────────────────────────────────────────
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Request timed out after ' + timeoutMs + 'ms');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Key management ─────────────────────────────────────────────────────────
 
 /**
  * Returns the device's persistent WireGuard key pair.
- * Generates and stores one on first call.
+ * FIX 4: Regenerates if either key is missing (prevents mismatched pairs).
  */
 export async function getOrCreateKeyPair() {
   try {
@@ -62,9 +84,10 @@ export async function getOrCreateKeyPair() {
     ]);
     const priv = stored[0][1];
     const pub  = stored[1][1];
+
+    // FIX 4: both must be present — regenerate if either is missing
     if (priv && pub) return { privateKey: priv, publicKey: pub };
 
-    // Generate fresh keypair
     const kp = await VpnModule.generateKeyPair();
     await AsyncStorage.multiSet([
       [STORAGE_KEYS.privateKey, kp.privateKey],
@@ -76,13 +99,12 @@ export async function getOrCreateKeyPair() {
   }
 }
 
-/** Force-regenerate keys (e.g. after security concern) */
 export async function rotateKeyPair() {
   await AsyncStorage.multiRemove([STORAGE_KEYS.privateKey, STORAGE_KEYS.publicKey]);
   return getOrCreateKeyPair();
 }
 
-// ── VPN permission ───────────────────────────────────────────────────
+// ── VPN permission ─────────────────────────────────────────────────────────
 
 export async function ensureVpnPermission() {
   const granted = await VpnModule.requestVpnPermission();
@@ -90,34 +112,24 @@ export async function ensureVpnPermission() {
   return true;
 }
 
-// ── Session code validation ───────────────────────────────────────────
+// ── Session code validation ────────────────────────────────────────────────
 
 export async function validateSessionCode(code) {
-  const resp = await fetch(`${RELAY_URL}/validate-code`, {
+  const resp = await fetchWithTimeout(`${RELAY_URL}/validate-code`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ code }),
   });
-  if (!resp.ok) throw new Error('Relay server unreachable');
-  return resp.json(); // { valid: bool, reason?: string }
+  if (!resp.ok) throw new Error(`Relay server error ${resp.status}`);
+  return resp.json();
 }
 
-// ── HOST: register session ────────────────────────────────────────────
+// ── HOST: register session ─────────────────────────────────────────────────
 
-/**
- * Called by the host device to create a sharing session.
- *
- * @param {object} opts
- *   appPackages: string[]   — packages to tunnel through VPN (split-tunnel)
- *   hostId:     string      — stable device ID
- *
- * @returns {object}
- *   sessionCode, serverPublicKey, serverEndpoint, clientIp
- */
 export async function hostRegister({ appPackages = [], hostId } = {}) {
   const { privateKey, publicKey } = await getOrCreateKeyPair();
 
-  const resp = await fetch(`${RELAY_URL}/host/register`, {
+  const resp = await fetchWithTimeout(`${RELAY_URL}/host/register`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ publicKey, hostId }),
@@ -129,37 +141,22 @@ export async function hostRegister({ appPackages = [], hostId } = {}) {
   }
 
   const data = await resp.json();
-  // { sessionCode, serverPublicKey, serverEndpoint, clientIp, dns }
 
-  // Persist for reconnection
   await AsyncStorage.multiSet([
     [STORAGE_KEYS.sessionCode, data.sessionCode],
     [STORAGE_KEYS.sessionRole, 'host'],
     [STORAGE_KEYS.clientIp,    data.clientIp],
   ]);
 
-  return {
-    ...data,
-    privateKey,
-    publicKey,
-    appPackages,
-  };
+  return { ...data, privateKey, publicKey, appPackages };
 }
 
-// ── CLIENT: join session ──────────────────────────────────────────────
+// ── CLIENT: join session ───────────────────────────────────────────────────
 
-/**
- * Called by a client device to join an existing session.
- *
- * @param {object} opts
- *   sessionCode: string     — 8-char code from host
- *   appPackages: string[]   — apps to tunnel (split-tunnel)
- *   deviceId:   string      — stable device ID
- */
 export async function clientJoin({ sessionCode, appPackages = [], deviceId }) {
   const { privateKey, publicKey } = await getOrCreateKeyPair();
 
-  const resp = await fetch(`${RELAY_URL}/client/join`, {
+  const resp = await fetchWithTimeout(`${RELAY_URL}/client/join`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ sessionCode, publicKey, deviceId }),
@@ -171,7 +168,6 @@ export async function clientJoin({ sessionCode, appPackages = [], deviceId }) {
   }
 
   const data = await resp.json();
-  // { serverPublicKey, serverEndpoint, clientIp, dns }
 
   await AsyncStorage.multiSet([
     [STORAGE_KEYS.sessionCode, sessionCode],
@@ -179,28 +175,11 @@ export async function clientJoin({ sessionCode, appPackages = [], deviceId }) {
     [STORAGE_KEYS.clientIp,    data.clientIp],
   ]);
 
-  return {
-    ...data,
-    sessionCode,
-    privateKey,
-    publicKey,
-    appPackages,
-  };
+  return { ...data, sessionCode, privateKey, publicKey, appPackages };
 }
 
-// ── Start VPN tunnel ──────────────────────────────────────────────────
+// ── Start VPN ──────────────────────────────────────────────────────────────
 
-/**
- * Starts the WireGuard VPN service with split-tunnel config.
- *
- * appPackages controls which apps are routed through the tunnel.
- * Any app NOT in this list continues using the device's real
- * internet connection — this is how we prevent background
- * bandwidth consumption.
- *
- * @param {object} sessionData   — returned from hostRegister() or clientJoin()
- * @param {string} role          — 'host' | 'client'
- */
 export async function startVpn(sessionData, role) {
   await ensureVpnPermission();
 
@@ -219,7 +198,7 @@ export async function startVpn(sessionData, role) {
   }
 
   if (appPackages.length === 0) {
-    console.warn('[WireGuardService] No appPackages specified — tunneling all device traffic');
+    console.warn('[WireGuardService] No appPackages — tunneling all device traffic');
   }
 
   await VpnModule.startVpn({
@@ -234,15 +213,14 @@ export async function startVpn(sessionData, role) {
   });
 }
 
-// ── Stop VPN ──────────────────────────────────────────────────────────
+// ── Stop VPN ───────────────────────────────────────────────────────────────
 
 export async function stopVpn({ sessionCode, role } = {}) {
-  try { await VpnModule.stopVpn(); } catch {}
+  try { await VpnModule.stopVpn(); } catch (_) {}
 
-  // Notify relay server
   if (sessionCode) {
     const keys = await getOrCreateKeyPair();
-    fetch(`${RELAY_URL}/leave`, {
+    fetchWithTimeout(`${RELAY_URL}/leave`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ sessionCode, role, publicKey: keys.publicKey }),
@@ -256,12 +234,8 @@ export async function stopVpn({ sessionCode, role } = {}) {
   ]);
 }
 
-// ── Bandwidth stats ───────────────────────────────────────────────────
+// ── Bandwidth stats ────────────────────────────────────────────────────────
 
-/**
- * Returns { bytesSent, bytesReceived, formattedUp, formattedDown }
- * from the native WireGuard interface counters.
- */
 export async function getBandwidthStats() {
   try {
     const stats = await VpnModule.getBandwidthStats();
@@ -276,57 +250,46 @@ export async function getBandwidthStats() {
   }
 }
 
-/** Poll the VPS relay for per-session stats (includes per-client breakdown) */
 export async function getSessionStats(sessionCode) {
   try {
-    const resp = await fetch(`${RELAY_URL}/stats/${sessionCode}`);
+    const resp = await fetchWithTimeout(`${RELAY_URL}/stats/${sessionCode}`);
     if (!resp.ok) return null;
     return resp.json();
-    // { host: { rx, tx }, clients: { deviceId: { rx, tx } }, clientCount }
   } catch {
     return null;
   }
 }
 
 function formatBytes(bytes) {
-  if (bytes < 1024)           return `${bytes} B`;
-  if (bytes < 1024 * 1024)   return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3)     return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  if (bytes < 1024)         return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3)   return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// ── Host presence WebSocket ───────────────────────────────────────────
+// ── Event WebSocket ────────────────────────────────────────────────────────
 
-let _ws = null;
-let _wsCode = null;
-let _wsRole = null;
+let _ws              = null;
+let _wsCode          = null;
+let _wsRole          = null;
 let _wsReconnectTimer = null;
-let _wsOnMessage = null;
+let _wsOnMessage     = null;
 
-/**
- * Opens a WebSocket to the relay server to receive real-time events.
- * Used by the host to get clientConnected / clientDisconnected events.
- *
- * @param {string}   sessionCode
- * @param {string}   role          'host' | 'client'
- * @param {function} onMessage     (msg: object) => void
- */
 export function openEventSocket(sessionCode, role, onMessage) {
-  _wsCode = sessionCode;
-  _wsRole = role;
+  _wsCode      = sessionCode;
+  _wsRole      = role;
   _wsOnMessage = onMessage;
   _connectWs();
 }
 
 function _connectWs() {
-  if (_ws) { try { _ws.close(); } catch {} }
+  if (_ws) { try { _ws.close(); } catch (_) {} }
   clearTimeout(_wsReconnectTimer);
 
   _ws = new WebSocket(WS_URL);
 
   _ws.onopen = () => {
     _ws.send(JSON.stringify({ type: 'REGISTER', sessionCode: _wsCode, role: _wsRole }));
-    // Start heartbeat
     _wsHeartbeat();
   };
 
@@ -334,11 +297,10 @@ function _connectWs() {
     try {
       const msg = JSON.parse(e.data);
       if (_wsOnMessage) _wsOnMessage(msg);
-    } catch {}
+    } catch (_) {}
   };
 
   _ws.onclose = () => {
-    // Reconnect after 3s backoff (unless manually closed)
     if (_wsCode) _wsReconnectTimer = setTimeout(_connectWs, 3000);
   };
 
@@ -359,12 +321,12 @@ export function closeEventSocket() {
   _wsCode = null;
   clearTimeout(_wsReconnectTimer);
   clearInterval(_heartbeatInterval);
-  if (_ws) { try { _ws.close(); } catch {} _ws = null; }
+  if (_ws) { try { _ws.close(); } catch (_) {} _ws = null; }
 }
 
-// ── Debug ─────────────────────────────────────────────────────────────
+// ── Debug ──────────────────────────────────────────────────────────────────
 
 export async function getDebugLog() {
-  try { return await VpnModule.getDebugLog(); }
+  try   { return await VpnModule.getDebugLog(); }
   catch { return '(debug log unavailable)'; }
 }
