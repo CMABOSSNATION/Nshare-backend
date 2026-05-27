@@ -36,7 +36,7 @@ const { VpnModule } = NativeModules;
 // Example: 'https://65.21.100.200:4000' or 'https://relay.yourdomain.com'
 export const RELAY_URL = __DEV__
   ? 'http://10.0.2.2:4000'
-  : 'https://YOUR_VPS_IP_OR_DOMAIN:4000'; // <-- CHANGE THIS
+  : 'VPS_ENDPOINT=178.105.190.123:51820'; // <-- CHANGE THIS
 
 const WS_URL = RELAY_URL.replace(/^http/, 'ws') + '/ws';
 
