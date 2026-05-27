@@ -1,0 +1,412 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Toolchain ───────────────────────────────────────────────────────────
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          # cache disabled: repo has no package-lock.json (npm install creates it)
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── Android SDK ─────────────────────────────────────────────────────────
+      - name: Accept Android SDK licenses
+        run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Install required Android SDK components
+        run: |
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" || true
+
+      # ── Gradle cache ────────────────────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('frontend/android/**/*.gradle*', 'frontend/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      # ── Node dependencies ───────────────────────────────────────────────────
+      - name: Install Node dependencies
+        run: npm install --legacy-peer-deps
+
+      # ── Android project config ──────────────────────────────────────────────
+      - name: Set up local.properties
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+      - name: Write root build.gradle
+        run: |
+          cat > android/build.gradle << 'EOF'
+          buildscript {
+              ext {
+                  buildToolsVersion = "34.0.0"
+                  minSdkVersion     = 24
+                  compileSdkVersion = 34
+                  targetSdkVersion  = 34
+              }
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath("com.android.tools.build:gradle:8.3.2")
+              }
+          }
+
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url "$rootDir/../node_modules/react-native/android" }
+                  maven { url "$rootDir/../node_modules/jsc-android/dist" }
+              }
+          }
+
+          task clean(type: Delete) {
+              delete rootProject.buildDir
+          }
+          EOF
+
+      - name: Write app/build.gradle
+        run: |
+          cat > android/app/build.gradle << 'EOF'
+          apply plugin: 'com.android.application'
+
+          android {
+              compileSdk 34
+              namespace "com.netshare"
+
+              defaultConfig {
+                  applicationId "com.netshare"
+                  minSdk        24
+                  targetSdk     34
+                  versionCode   1
+                  versionName   "1.0"
+              }
+
+              buildTypes {
+                  debug   { debuggable true }
+                  release {
+                      minifyEnabled false
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              implementation "com.facebook.react:react-android:0.74.2"
+              implementation "com.facebook.react:hermes-android:0.74.2"
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'org.java-websocket:Java-WebSocket:1.5.4'
+              implementation 'com.google.code.gson:gson:2.10.1'
+              implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+          }
+          EOF
+
+      - name: Write gradle.properties
+        run: |
+          cat > android/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m
+          android.useAndroidX=true
+          android.enableJetifier=true
+          EOF
+
+      - name: Write settings.gradle
+        run: |
+          cat > android/settings.gradle << 'EOF'
+          rootProject.name = 'NshareApp'
+          include ':app'
+          EOF
+
+      # ── Gradle wrapper ──────────────────────────────────────────────────────
+      - name: Write gradle-wrapper.properties
+        run: |
+          mkdir -p android/gradle/wrapper
+          cat > android/gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.6-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+      - name: Generate gradlew (if missing)
+        run: |
+          if [ ! -f android/gradlew ]; then
+            gradle wrapper --gradle-version=8.6 --project-dir=android
+          fi
+          chmod +x android/gradlew
+
+      # ── Java source scaffold ─────────────────────────────────────────────────
+      - name: Create Java source directories
+        run: |
+          mkdir -p android/app/src/main/java/com/netshare
+          mkdir -p android/app/src/main/java/netshare
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/assets
+
+      - name: Write MainApplication.java
+        run: |
+          cat > android/app/src/main/java/com/netshare/MainApplication.java << 'EOF'
+          package com.netshare;
+
+          import android.app.Application;
+          import com.facebook.react.ReactApplication;
+          import com.facebook.react.ReactNativeHost;
+          import com.facebook.react.ReactPackage;
+          import com.facebook.react.defaults.DefaultReactNativeHost;
+          import java.util.Arrays;
+          import java.util.List;
+
+          // NOTE: PackageList is auto-generated by RN autolinking at build time.
+          // We do NOT import it here — instead we register VpnPackage directly
+          // in getPackages() to avoid "cannot find symbol: PackageList" errors
+          // when the workflow writes this file before autolinking has run.
+
+          public class MainApplication extends Application implements ReactApplication {
+
+              private final ReactNativeHost mReactNativeHost =
+                  new DefaultReactNativeHost(this) {
+                      @Override public boolean getUseDeveloperSupport() { return false; }
+
+                      @Override
+                      protected List<ReactPackage> getPackages() {
+                          // Register only our VpnPackage — no autolinking needed
+                          // since this project has no other native modules.
+                          return Arrays.<ReactPackage>asList(new VpnPackage());
+                      }
+
+                      @Override protected String  getJSMainModuleName() { return "index"; }
+                      @Override protected boolean isNewArchEnabled()     { return false; }
+                      @Override protected Boolean isHermesEnabled()      { return true; }
+                  };
+
+              @Override public ReactNativeHost getReactNativeHost() { return mReactNativeHost; }
+              @Override public void onCreate() { super.onCreate(); }
+          }
+          EOF
+
+      - name: Write MainActivity.java
+        run: |
+          cat > android/app/src/main/java/com/netshare/MainActivity.java << 'EOF'
+          package com.netshare;
+
+          import android.content.Intent;
+          import com.facebook.react.ReactActivity;
+          import com.facebook.react.ReactActivityDelegate;
+          import com.facebook.react.bridge.ReactContext;
+          import com.facebook.react.defaults.DefaultReactActivityDelegate;
+          import netshare.VpnModule;
+
+          public class MainActivity extends ReactActivity {
+
+              @Override protected String getMainComponentName() { return "Nshare"; }
+
+              @Override
+              protected ReactActivityDelegate createReactActivityDelegate() {
+                  return new DefaultReactActivityDelegate(this, getMainComponentName(), false);
+              }
+
+              @Override
+              public void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (getReactInstanceManager() == null) return;
+                  ReactContext ctx = getReactInstanceManager().getCurrentReactContext();
+                  if (ctx == null) return;
+                  VpnModule module = ctx.getNativeModule(VpnModule.class);
+                  if (module != null) module.onActivityResult(requestCode, resultCode, data);
+              }
+          }
+          EOF
+
+      - name: Write VpnPackage.java
+        run: |
+          cat > android/app/src/main/java/com/netshare/VpnPackage.java << 'EOF'
+          package com.netshare;
+
+          import com.facebook.react.ReactPackage;
+          import com.facebook.react.bridge.NativeModule;
+          import com.facebook.react.bridge.ReactApplicationContext;
+          import com.facebook.react.uimanager.ViewManager;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.List;
+          import netshare.VpnModule;
+
+          public class VpnPackage implements ReactPackage {
+              @Override
+              public List<NativeModule> createNativeModules(ReactApplicationContext ctx) {
+                  return Arrays.<NativeModule>asList(new VpnModule(ctx));
+              }
+              @Override
+              public List<ViewManager> createViewManagers(ReactApplicationContext ctx) {
+                  return Collections.emptyList();
+              }
+          }
+          EOF
+
+      # ── No patching needed — files committed directly to repo ──────────────────
+      - name: Verify Java source files exist
+        run: |
+          ls android/app/src/main/java/netshare/NetShareVpnService.java
+          ls android/app/src/main/java/netshare/VpnModule.java
+          echo "Java source files OK"
+
+            # ── AndroidManifest ──────────────────────────────────────────────────────
+      - name: Write AndroidManifest.xml
+        run: |
+          cat > android/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+              <application
+                  android:name=".MainApplication"
+                  android:label="NShare"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name="netshare.NetShareVpnService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="VPN tunneling for internet sharing" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+      # ── Resources ────────────────────────────────────────────────────────────
+      - name: Write strings.xml
+        run: |
+          cat > android/app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NShare</string>
+          </resources>
+          EOF
+
+      - name: Write styles.xml
+        run: |
+          cat > android/app/src/main/res/values/styles.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar" />
+          </resources>
+          EOF
+
+      - name: Write proguard-rules.pro
+        run: |
+          cat > android/app/proguard-rules.pro << 'EOF'
+          -keep class com.facebook.react.** { *; }
+          -keep class org.java_websocket.**  { *; }
+          -keep class com.google.gson.**     { *; }
+          -keep class com.netshare.**        { *; }
+          -keep class netshare.**            { *; }
+          # Bouncy Castle (needed for X25519 on Android < 13)
+          -keep class org.bouncycastle.**    { *; }
+          EOF
+
+      # ── JS config files ──────────────────────────────────────────────────────
+      - name: Write app.json
+        run: |
+          cat > app.json << 'EOF'
+          { "name": "Nshare", "displayName": "NShare" }
+          EOF
+
+      - name: Write metro.config.js
+        run: |
+          cat > metro.config.js << 'EOF'
+          const {getDefaultConfig, mergeConfig} = require('@react-native/metro-config');
+          module.exports = mergeConfig(getDefaultConfig(__dirname), {});
+          EOF
+
+      - name: Write babel.config.js
+        run: |
+          cat > babel.config.js << 'EOF'
+          module.exports = { presets: ['module:@react-native/babel-preset'] };
+          EOF
+
+      # ── Bundle JS ────────────────────────────────────────────────────────────
+      - name: Bundle React Native JS
+        run: |
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+
+      # ── Build APK ────────────────────────────────────────────────────────────
+      - name: Build Debug APK
+        run: cd android && ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=512m'
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+
+      # ── Upload ───────────────────────────────────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nshare-debug-apk
+          path: frontend/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
