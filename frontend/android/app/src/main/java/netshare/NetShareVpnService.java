@@ -1,4 +1,4 @@
-package com.netshare;
+package netshare;
 
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -27,42 +27,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * NetShareVpnService — WireGuard Edition
- *
- * ═══════ BUGS FIXED IN THIS FILE ═══════
- *
- * BUG 1 — x25519PublicKey() returned random bytes (crash-causing handshake failure)
- *   In WireGuardSession.buildInitiation(), x25519PublicKey(ePriv) was supposed to
- *   return the Curve25519 public key for the ephemeral private key ePriv. But the
- *   original implementation generated a random new private key and returned *its*
- *   public key — completely ignoring ePriv. This meant the ECDH step used a
- *   mismatched key pair, the VPS rejected the handshake, and the tunnel never
- *   connected. The app appeared to "crash" because it was stuck in reconnect loops.
- *   FIX: x25519PublicKey() now correctly derives the public key from the given
- *   private scalar using BouncyCastle (Android 7+) or the XDH KeyFactory (Android 13+).
- *
- * BUG 2 — processResponse() used wrong key derivation for session keys
- *   The original extracted send/recvKey directly from x25519(localPrivKey, remotePubKey),
- *   but WireGuard Noise_IKpsk2 requires a final HKDF step over the handshake chaining key
- *   (not just a raw DH result). Without this, the session keys were always wrong and every
- *   subsequent transport packet was silently dropped.
- *   FIX: Proper HKDF-based session key derivation using the chaining key from
- *   buildInitiation() stored in the session state.
- *
- * BUG 3 — ChaCha20-Poly1305 IvParameterSpec was 12 bytes but needs GCMParameterSpec
- *   Android's JCE provider requires GCMParameterSpec (not IvParameterSpec) for
- *   AEAD ciphers including ChaCha20-Poly1305. Using IvParameterSpec threw
- *   InvalidAlgorithmParameterException at runtime, crashing every encrypt/decrypt call.
- *   FIX: All AEAD operations now use GCMParameterSpec(128, nonce).
- *
- * BUG 4 — START_STICKY null-intent path called stopVpnClean() then returned START_STICKY
- *   If Android restarts the service after an OOM kill with a null intent, the original
- *   code called stopVpnClean() but then fell through to return START_STICKY — meaning
- *   Android would restart it again immediately, looping forever and preventing the UI
- *   from showing a "reconnect" state.
- *   FIX: Return START_NOT_STICKY in the null-intent path (stop cleanly, let UI reconnect).
- */
 public class NetShareVpnService extends VpnService {
 
     private static final String TAG        = "NetShareVPN";
@@ -74,7 +38,7 @@ public class NetShareVpnService extends VpnService {
     private static final int WG_REKEY_AFTER_MS = 180_000;
     private static final int RECONNECT_MAX_MS  = 30_000;
 
-    // ── Debug log ─────────────────────────────────────────────────────────
+    // ── Debug log ──────────────────────────────────────────────────────
     private static final int MAX_DEBUG_LINES = 200;
     private static final java.util.ArrayDeque<String> debugLog = new java.util.ArrayDeque<>();
 
@@ -90,14 +54,14 @@ public class NetShareVpnService extends VpnService {
         return String.join("\n", debugLog);
     }
 
-    // ── Service state ──────────────────────────────────────────────────────
+    // ── Service state ──────────────────────────────────────────────────
     private ParcelFileDescriptor     vpnInterface;
     private DatagramChannel          wgChannel;
     private ExecutorService          executor;
     private ScheduledExecutorService scheduler;
-    private final AtomicBoolean      isRunning  = new AtomicBoolean(false);
-    private final AtomicLong         bytesIn    = new AtomicLong(0);
-    private final AtomicLong         bytesOut   = new AtomicLong(0);
+    private final AtomicBoolean      isRunning = new AtomicBoolean(false);
+    private final AtomicLong         bytesIn   = new AtomicLong(0);
+    private final AtomicLong         bytesOut  = new AtomicLong(0);
 
     private String   serverEndpoint;
     private String   serverPublicKey;
@@ -110,16 +74,14 @@ public class NetShareVpnService extends VpnService {
 
     private WireGuardSession wgSession;
 
-    // ── Lifecycle ──────────────────────────────────────────────────────────
+    // ── Lifecycle ──────────────────────────────────────────────────────
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // BUG 4 FIX: null intent means Android restarted us after OOM kill.
-        // Stop cleanly and return START_NOT_STICKY so Android doesn't loop.
         if (intent == null) {
-            dbg("Service restarted by Android (null intent) — stopping cleanly so UI can reconnect");
+            dbg("Restarted by Android after OOM — stopping cleanly");
             stopVpnClean();
-            return START_NOT_STICKY; // ← was START_STICKY (caused infinite restart loop)
+            return START_NOT_STICKY;
         }
 
         if ("STOP_VPN".equals(intent.getAction())) {
@@ -145,7 +107,7 @@ public class NetShareVpnService extends VpnService {
         }
 
         if (serverEndpoint == null || serverPublicKey == null || clientIp == null) {
-            dbg("ERROR: missing required intent extras");
+            dbg("ERROR: missing required config");
             stopSelf();
             return START_NOT_STICKY;
         }
@@ -155,9 +117,7 @@ public class NetShareVpnService extends VpnService {
         scheduler = Executors.newScheduledThreadPool(2);
         VpnModule.activeService = this;
         isRunning.set(true);
-
         executor.execute(this::startTunnel);
-
         return START_STICKY;
     }
 
@@ -167,28 +127,28 @@ public class NetShareVpnService extends VpnService {
         super.onDestroy();
     }
 
-    // ── Tunnel setup ──────────────────────────────────────────────────────
+    // ── Tunnel ────────────────────────────────────────────────────────
 
     private void startTunnel() {
-        int reconnectDelay = 2000;
+        int delay = 2000;
         while (isRunning.get()) {
             try {
                 doConnect();
-                reconnectDelay = 2000;
+                delay = 2000;
             } catch (Exception e) {
                 if (!isRunning.get()) break;
-                dbg("Tunnel error — reconnecting in " + reconnectDelay + "ms: " + e.getMessage());
+                dbg("Tunnel error — reconnecting in " + delay + "ms: " + e.getMessage());
                 VpnModule.emitEvent("vpnError", e.getMessage());
-                try { Thread.sleep(reconnectDelay); } catch (InterruptedException ie) { break; }
-                reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+                try { Thread.sleep(delay); } catch (InterruptedException ie) { break; }
+                delay = Math.min(delay * 2, RECONNECT_MAX_MS);
             }
         }
     }
 
     private void doConnect() throws Exception {
-        dbg("Connecting WireGuard → " + serverEndpoint);
+        dbg("Connecting to " + serverEndpoint);
 
-        // 1. Build TUN interface
+        // Build TUN interface
         Builder builder = new Builder();
         builder.setSession("NetShare")
                .addAddress(clientIp, 24)
@@ -198,30 +158,27 @@ public class NetShareVpnService extends VpnService {
                .addDnsServer("8.8.8.8")
                .setMtu(TUN_MTU);
 
-        boolean splitTunnelApplied = false;
+        try { builder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+
         if (appPackages != null && appPackages.length > 0) {
-            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
             for (String pkg : appPackages) {
-                try { builder.addAllowedApplication(pkg); splitTunnelApplied = true; }
+                try { builder.addAllowedApplication(pkg); }
                 catch (Exception e) { dbg("WARN: addAllowedApplication(" + pkg + "): " + e.getMessage()); }
             }
-        }
-        if (!splitTunnelApplied) {
-            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
-            dbg("WARN: no app packages — tunneling all traffic");
-        } else {
             dbg("Split-tunnel: " + appPackages.length + " apps");
+        } else {
+            dbg("Tunneling all traffic");
         }
 
         if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} }
         vpnInterface = builder.establish();
-        if (vpnInterface == null) throw new IOException("VPN establish() returned null");
-        dbg("TUN established, ip=" + clientIp);
+        if (vpnInterface == null) throw new IOException("VPN establish() returned null — permission revoked?");
+        dbg("TUN up, ip=" + clientIp);
 
-        // 2. UDP channel to VPS
-        String[] parts   = serverEndpoint.split(":");
+        // UDP socket to VPS
+        String[] parts = serverEndpoint.split(":");
         InetAddress addr = InetAddress.getByName(parts[0]);
-        int port         = Integer.parseInt(parts[1]);
+        int port = Integer.parseInt(parts[1]);
 
         if (wgChannel != null) { try { wgChannel.close(); } catch (Exception ignored) {} }
         wgChannel = DatagramChannel.open();
@@ -230,49 +187,40 @@ public class NetShareVpnService extends VpnService {
         wgChannel.socket().setSoTimeout(500);
         wgChannel.connect(new InetSocketAddress(addr, port));
 
-        // 3. WireGuard handshake
+        // WireGuard handshake
         wgSession = new WireGuardSession(clientPrivateKey, clientPublicKey, serverPublicKey, wgChannel);
-        if (!wgSession.doHandshake()) throw new IOException("WireGuard handshake failed");
-        dbg("Handshake complete");
+        if (!wgSession.doHandshake()) throw new IOException("WireGuard handshake failed after 5 attempts");
+        dbg("Handshake OK");
 
         VpnModule.emitEvent("vpnConnected", "wg-ok");
         VpnModule.emitEvent("sessionCreated", sessionCode != null ? sessionCode : "");
 
-        // 4. Keepalive + rekey
-        scheduler.scheduleAtFixedRate(this::sendKeepalive, WG_KEEPALIVE_MS, WG_KEEPALIVE_MS, TimeUnit.MILLISECONDS);
-        scheduler.scheduleAtFixedRate(this::rekeyIfNeeded, WG_REKEY_AFTER_MS, WG_REKEY_AFTER_MS, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(this::sendKeepalive,  WG_KEEPALIVE_MS,   WG_KEEPALIVE_MS,   TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(this::rekeyIfNeeded,  WG_REKEY_AFTER_MS, WG_REKEY_AFTER_MS, TimeUnit.MILLISECONDS);
 
-        // 5. I/O loops
         FileInputStream  tunIn  = new FileInputStream(vpnInterface.getFileDescriptor());
         FileOutputStream tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
 
-        java.util.concurrent.Future<?> inFuture  = executor.submit(() -> tunToWg(tunIn));
-        java.util.concurrent.Future<?> outFuture = executor.submit(() -> wgToTun(tunOut));
+        java.util.concurrent.Future<?> inFuture = executor.submit(() -> tunToWg(tunIn));
+        executor.submit(() -> wgToTun(tunOut));
 
         try { inFuture.get(); } catch (Exception ignored) {}
-        outFuture.cancel(true);
-
-        if (isRunning.get()) {
-            dbg("I/O loop exited unexpectedly — will reconnect");
-            throw new IOException("I/O loop exited");
-        }
+        if (isRunning.get()) throw new IOException("I/O loop exited — reconnecting");
     }
 
-    // ── TUN → WireGuard ──────────────────────────────────────────────────
+    // ── I/O loops ─────────────────────────────────────────────────────
 
     private void tunToWg(FileInputStream tunIn) {
-        byte[] rawBuf = new byte[TUN_MTU];
+        byte[] buf = new byte[TUN_MTU];
         while (isRunning.get()) {
             try {
-                int len = tunIn.read(rawBuf);
+                int len = tunIn.read(buf);
                 if (len <= 0) continue;
-
-                byte[] encrypted = wgSession.encryptTransport(rawBuf, 0, len);
-                if (encrypted == null) continue;
-
-                wgChannel.write(ByteBuffer.wrap(encrypted));
+                byte[] enc = wgSession.encryptTransport(buf, 0, len);
+                if (enc == null) continue;
+                wgChannel.write(ByteBuffer.wrap(enc));
                 bytesOut.addAndGet(len);
-            } catch (InterruptedException | java.io.InterruptedIOException e) {
+            } catch (java.io.InterruptedIOException e) {
                 break;
             } catch (Exception e) {
                 if (isRunning.get()) dbg("tunToWg: " + e.getMessage());
@@ -281,8 +229,6 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
-    // ── WireGuard → TUN ──────────────────────────────────────────────────
-
     private void wgToTun(FileOutputStream tunOut) {
         ByteBuffer buf = ByteBuffer.allocate(TUN_MTU + 64);
         while (isRunning.get()) {
@@ -290,18 +236,15 @@ public class NetShareVpnService extends VpnService {
                 buf.clear();
                 int n = wgChannel.read(buf);
                 if (n <= 0) continue;
-
                 buf.flip();
                 byte[] raw = new byte[buf.remaining()];
                 buf.get(raw);
-
-                byte[] decrypted = wgSession.decryptTransport(raw);
-                if (decrypted == null) continue;
-
-                tunOut.write(decrypted);
-                bytesIn.addAndGet(decrypted.length);
+                byte[] dec = wgSession.decryptTransport(raw);
+                if (dec == null) continue;
+                tunOut.write(dec);
+                bytesIn.addAndGet(dec.length);
             } catch (java.net.SocketTimeoutException ignored) {
-            } catch (InterruptedException | java.io.InterruptedIOException e) {
+            } catch (java.io.InterruptedIOException e) {
                 break;
             } catch (Exception e) {
                 if (isRunning.get()) dbg("wgToTun: " + e.getMessage());
@@ -310,7 +253,7 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
-    // ── Keepalive / Rekey ─────────────────────────────────────────────────
+    // ── Keepalive / Rekey ─────────────────────────────────────────────
 
     private void sendKeepalive() {
         if (!isRunning.get() || wgSession == null) return;
@@ -329,13 +272,11 @@ public class NetShareVpnService extends VpnService {
         } catch (Exception e) { dbg("rekey: " + e.getMessage()); }
     }
 
-    // ── Stats ─────────────────────────────────────────────────────────────
+    // ── Stats / Stop ──────────────────────────────────────────────────
 
     public long[] getBandwidthStats() {
         return new long[]{ bytesOut.get(), bytesIn.get() };
     }
-
-    // ── Stop ─────────────────────────────────────────────────────────────
 
     private volatile boolean stopCalled = false;
 
@@ -344,10 +285,10 @@ public class NetShareVpnService extends VpnService {
         stopCalled = true;
         isRunning.set(false);
         dbg("Stopping...");
-        try { if (scheduler    != null) scheduler.shutdownNow();  } catch (Exception ignored) {}
-        try { if (executor     != null) executor.shutdownNow();   } catch (Exception ignored) {}
-        try { if (wgChannel    != null) wgChannel.close();        } catch (Exception ignored) {}
-        try { if (vpnInterface != null) vpnInterface.close();     } catch (Exception ignored) {}
+        try { if (scheduler    != null) scheduler.shutdownNow(); } catch (Exception ignored) {}
+        try { if (executor     != null) executor.shutdownNow();  } catch (Exception ignored) {}
+        try { if (wgChannel    != null) wgChannel.close();       } catch (Exception ignored) {}
+        try { if (vpnInterface != null) vpnInterface.close();    } catch (Exception ignored) {}
         vpnInterface = null;
         wgChannel    = null;
         wgSession    = null;
@@ -359,7 +300,7 @@ public class NetShareVpnService extends VpnService {
 
     public void sendControlMessage(String json) { dbg("control: " + json); }
 
-    // ── Notification ──────────────────────────────────────────────────────
+    // ── Notification ──────────────────────────────────────────────────
 
     private void startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -370,7 +311,7 @@ public class NetShareVpnService extends VpnService {
         }
         Intent stop = new Intent(this, NetShareVpnService.class);
         stop.setAction("STOP_VPN");
-        PendingIntent stopPi = PendingIntent.getService(this, 0, stop,
+        PendingIntent pi = PendingIntent.getService(this, 0, stop,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Notification notif = new NotificationCompat.Builder(this, CHANNEL_ID)
@@ -378,7 +319,7 @@ public class NetShareVpnService extends VpnService {
             .setContentText(appPackages != null ? appPackages.length + " apps tunnelled" : "Tunnel active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopPi)
+            .addAction(android.R.drawable.ic_delete, "Stop", pi)
             .build();
         startForeground(NOTIF_ID, notif);
     }
@@ -412,16 +353,13 @@ public class NetShareVpnService extends VpnService {
         private int    localIndex;
         private int    remoteIndex;
         private volatile boolean sessionReady = false;
-
-        // BUG 2 FIX: store chaining key across handshake phases
         private byte[] _lastCk;
 
-        WireGuardSession(String privKeyB64, String pubKeyB64, String remotePubKeyB64,
-                         DatagramChannel channel) {
-            this.channel      = channel;
-            this.localPrivKey = decodeBase64(privKeyB64);
-            this.localPubKey  = decodeBase64(pubKeyB64);
-            this.remotePubKey = decodeBase64(remotePubKeyB64);
+        WireGuardSession(String privB64, String pubB64, String remotePubB64, DatagramChannel ch) {
+            this.channel      = ch;
+            this.localPrivKey = decodeBase64(privB64);
+            this.localPubKey  = decodeBase64(pubB64);
+            this.remotePubKey = decodeBase64(remotePubB64);
             this.localIndex   = (int)(Math.random() * Integer.MAX_VALUE);
             this.sendCounter  = 0;
             this.recvCounter  = 0;
@@ -453,7 +391,7 @@ public class NetShareVpnService extends VpnService {
                         } catch (java.net.SocketTimeoutException ignored) {}
                     }
                 } catch (Exception e) {
-                    Log.w("WG", "Handshake attempt " + attempt + ": " + e.getMessage());
+                    Log.w("WG", "Attempt " + attempt + ": " + e.getMessage());
                 }
                 try { Thread.sleep(1000L * (attempt + 1)); } catch (InterruptedException e) { return false; }
             }
@@ -462,7 +400,6 @@ public class NetShareVpnService extends VpnService {
 
         private byte[] buildInitiation() throws Exception {
             byte[] ePriv = generateX25519Private();
-            // BUG 1 FIX: x25519PublicKey() now correctly derives from ePriv
             byte[] ePub  = x25519PublicKey(ePriv);
 
             byte[] ck = blake2s(CONSTRUCTION);
@@ -485,7 +422,6 @@ public class NetShareVpnService extends VpnService {
             ck  = Arrays.copyOfRange(out, 0, 32);
             k   = Arrays.copyOfRange(out, 32, 64);
 
-            // BUG 2 FIX: save chaining key for use in processResponse()
             _lastCk = ck.clone();
 
             byte[] ts    = tai64nNow();
@@ -501,36 +437,20 @@ public class NetShareVpnService extends VpnService {
             ByteBuffer msg = ByteBuffer.allocate(148);
             msg.put((byte) MSG_INITIATION).put((byte)0).put((byte)0).put((byte)0);
             msg.putInt(Integer.reverseBytes(localIndex));
-            msg.put(ePub);         // 32 bytes
-            msg.put(encS);         // 48 bytes
-            msg.put(encTs);        // 28 bytes
-            msg.put(mac1);         // 16 bytes
-            msg.put(new byte[16]); // mac2 (zero — no cookie)
+            msg.put(ePub);
+            msg.put(encS);
+            msg.put(encTs);
+            msg.put(mac1);
+            msg.put(new byte[16]); // mac2 zero
             return msg.array();
         }
 
-        /**
-         * BUG 2 FIX: session keys derived properly via HKDF from the chaining key.
-         *
-         * WireGuard Noise_IKpsk2 specifies that after receiving the response,
-         * the initiator computes the session keys as:
-         *   (temp1, temp2, temp3) = HKDF3(chaining_key, empty)
-         *   sendKey = temp2   (initiator → responder)
-         *   recvKey = temp3   (responder → initiator)
-         *
-         * The original code derived keys from a single raw DH result (wrong),
-         * producing keys that the VPS would never accept.
-         */
         private boolean processResponse(byte[] raw) {
             if (raw.length < 92 || (raw[0] & 0xFF) != MSG_RESPONSE) return false;
             try {
                 remoteIndex = bytesToInt(raw, 4);
-
                 if (_lastCk == null) return false;
-
-                // HKDF3 over the chaining key with empty IKM → three 32-byte outputs
-                byte[] t1 = hkdf1(_lastCk, new byte[0]);      // temp1 (new CK — not used here)
-                // Derive temp2 (send key) and temp3 (recv key)
+                byte[] t1       = hkdf1(_lastCk, new byte[0]);
                 byte[] sendRecv = hkdf2(t1, new byte[0]);
                 sendKey     = Arrays.copyOfRange(sendRecv, 0, 32);
                 recvKey     = Arrays.copyOfRange(sendRecv, 32, 64);
@@ -544,7 +464,7 @@ public class NetShareVpnService extends VpnService {
             }
         }
 
-        byte[] encryptTransport(byte[] plaintext, int offset, int length) {
+        byte[] encryptTransport(byte[] pt, int offset, int length) {
             if (!sessionReady || sendKey == null) return null;
             try {
                 long counter = sendCounter++;
@@ -552,7 +472,7 @@ public class NetShareVpnService extends VpnService {
                 hdr.put((byte) MSG_TRANSPORT).put((byte)0).put((byte)0).put((byte)0);
                 hdr.putInt(Integer.reverseBytes(remoteIndex));
                 hdr.putLong(Long.reverseBytes(counter));
-                byte[] payload = Arrays.copyOfRange(plaintext, offset, offset + length);
+                byte[] payload = Arrays.copyOfRange(pt, offset, offset + length);
                 byte[] enc     = aeadEncrypt(sendKey, counter, payload, new byte[0]);
                 byte[] result  = new byte[16 + enc.length];
                 System.arraycopy(hdr.array(), 0, result, 0, 16);
@@ -568,8 +488,8 @@ public class NetShareVpnService extends VpnService {
             if (!sessionReady || recvKey == null || raw.length < 32) return null;
             if ((raw[0] & 0xFF) != MSG_TRANSPORT) return null;
             try {
-                long counter   = Long.reverseBytes(ByteBuffer.wrap(raw, 8, 8).getLong());
-                byte[] cipher  = Arrays.copyOfRange(raw, 16, raw.length);
+                long counter  = Long.reverseBytes(ByteBuffer.wrap(raw, 8, 8).getLong());
+                byte[] cipher = Arrays.copyOfRange(raw, 16, raw.length);
                 return aeadDecrypt(recvKey, counter, cipher, new byte[0]);
             } catch (Exception e) {
                 Log.w("WG", "decryptTransport: " + e.getMessage());
@@ -579,18 +499,12 @@ public class NetShareVpnService extends VpnService {
 
         byte[] buildKeepalive() { return encryptTransport(new byte[0], 0, 0); }
 
-        // ── Crypto helpers ─────────────────────────────────────────────────
+        // ── Crypto ────────────────────────────────────────────────────
 
-        /**
-         * BUG 3 FIX: Android's JCE requires GCMParameterSpec for AEAD ciphers.
-         * Using IvParameterSpec with ChaCha20-Poly1305 throws
-         * InvalidAlgorithmParameterException at runtime on all Android versions.
-         */
         private static byte[] aeadEncrypt(byte[] key, long counter, byte[] pt, byte[] aad) throws Exception {
             javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("ChaCha20-Poly1305");
             c.init(javax.crypto.Cipher.ENCRYPT_MODE,
                 new javax.crypto.spec.SecretKeySpec(key, "ChaCha20"),
-                // BUG 3 FIX: GCMParameterSpec instead of IvParameterSpec
                 new javax.crypto.spec.GCMParameterSpec(128, counterToNonce(counter)));
             c.updateAAD(aad);
             return c.doFinal(pt);
@@ -600,16 +514,15 @@ public class NetShareVpnService extends VpnService {
             javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("ChaCha20-Poly1305");
             c.init(javax.crypto.Cipher.DECRYPT_MODE,
                 new javax.crypto.spec.SecretKeySpec(key, "ChaCha20"),
-                // BUG 3 FIX: GCMParameterSpec instead of IvParameterSpec
                 new javax.crypto.spec.GCMParameterSpec(128, counterToNonce(counter)));
             c.updateAAD(aad);
             return c.doFinal(ct);
         }
 
         private static byte[] counterToNonce(long counter) {
-            byte[] nonce = new byte[12];
-            for (int i = 0; i < 8; i++) nonce[4 + i] = (byte)((counter >> (8 * i)) & 0xFF);
-            return nonce;
+            byte[] n = new byte[12];
+            for (int i = 0; i < 8; i++) n[4 + i] = (byte)((counter >> (8 * i)) & 0xFF);
+            return n;
         }
 
         private static byte[] x25519(byte[] priv, byte[] pub) throws Exception {
@@ -630,18 +543,23 @@ public class NetShareVpnService extends VpnService {
         }
 
         private static byte[] x25519ViaBouncy(byte[] priv, byte[] pub) throws Exception {
-            Class<?> cls       = Class.forName("org.bouncycastle.crypto.agreement.X25519Agreement");
-            Class<?> privCls   = Class.forName("org.bouncycastle.crypto.params.X25519PrivateKeyParameters");
-            Class<?> pubCls    = Class.forName("org.bouncycastle.crypto.params.X25519PublicKeyParameters");
-            Class<?> cipherCls = Class.forName("org.bouncycastle.crypto.CipherParameters");
-            Object agreement   = cls.getDeclaredConstructor().newInstance();
-            Object privParam   = privCls.getDeclaredConstructor(byte[].class, int.class).newInstance(priv, 0);
-            Object pubParam    = pubCls.getDeclaredConstructor(byte[].class, int.class).newInstance(pub, 0);
-            cls.getMethod("init", cipherCls).invoke(agreement, privParam);
+            Class<?> cls     = Class.forName("org.bouncycastle.crypto.agreement.X25519Agreement");
+            Class<?> privCls = Class.forName("org.bouncycastle.crypto.params.X25519PrivateKeyParameters");
+            Class<?> pubCls  = Class.forName("org.bouncycastle.crypto.params.X25519PublicKeyParameters");
+            Class<?> cipCls  = Class.forName("org.bouncycastle.crypto.CipherParameters");
+            Object   ag      = cls.getDeclaredConstructor().newInstance();
+            Object   privP   = privCls.getDeclaredConstructor(byte[].class, int.class).newInstance(priv, 0);
+            Object   pubP    = pubCls.getDeclaredConstructor(byte[].class, int.class).newInstance(pub, 0);
+            cls.getMethod("init", cipCls).invoke(ag, privP);
             byte[] out = new byte[32];
-            cls.getMethod("calculateAgreement", cipherCls, byte[].class, int.class)
-               .invoke(agreement, pubParam, out, 0);
+            cls.getMethod("calculateAgreement", cipCls, byte[].class, int.class).invoke(ag, pubP, out, 0);
             return out;
+        }
+
+        private static byte[] x25519PublicKey(byte[] priv) throws Exception {
+            byte[] basePoint = new byte[32];
+            basePoint[0] = 9; // Curve25519 base point u = 9
+            return x25519(priv, basePoint);
         }
 
         private static byte[] generateX25519Private() {
@@ -653,24 +571,18 @@ public class NetShareVpnService extends VpnService {
             return key;
         }
 
-        /**
-         * BUG 1 FIX: derive the Curve25519 public key from the given private scalar.
-         * Original code generated a RANDOM new private key and returned its public key,
-         * ignoring the priv argument entirely — causing every handshake to fail.
-         */
-        private static byte[] x25519PublicKey(byte[] priv) throws Exception {
-            // Curve25519 public key = priv * basePoint
-            // Base point u = 9 (Curve25519 / RFC 7748)
-            byte[] basePoint = new byte[32];
-            basePoint[0] = 9;
-            return x25519(priv, basePoint);
-        }
-
         private static byte[] blake2s(byte[] data) throws Exception {
-            // SHA-256 approximation (same 32-byte output).
-            // For strict WireGuard compliance, replace with actual BLAKE2s
-            // via BouncyCastle: new Blake2sDigest(256).
-            return java.security.MessageDigest.getInstance("SHA-256").digest(data);
+            try {
+                Class<?> cls = Class.forName("org.bouncycastle.crypto.digests.Blake2sDigest");
+                Object d = cls.getDeclaredConstructor(int.class).newInstance(256);
+                cls.getMethod("update", byte[].class, int.class, int.class).invoke(d, data, 0, data.length);
+                byte[] out = new byte[32];
+                cls.getMethod("doFinal", byte[].class, int.class).invoke(d, out, 0);
+                return out;
+            } catch (ClassNotFoundException e) {
+                // Fallback to SHA-256 if Bouncy Castle not available (handshake will fail vs strict WG)
+                return java.security.MessageDigest.getInstance("SHA-256").digest(data);
+            }
         }
 
         private static byte[] blake2sMac(byte[] key, byte[] data) throws Exception {
