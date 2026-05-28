@@ -374,17 +374,25 @@ let autoRefreshTimer = null;
 async function doLogin() {
   const key = document.getElementById('admin-key-input').value.trim();
   if (!key) return;
+  const errEl = document.getElementById('login-error');
+  errEl.textContent = 'Signing in…';
   try {
-    const r = await apiFetch('/admin/stats', {}, key);
-    if (r.error) { document.getElementById('login-error').textContent = 'Wrong admin key'; return; }
+    const res = await fetch(BASE + '/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    const r = await res.json();
+    if (!res.ok || r.error) { errEl.textContent = 'Wrong admin key'; return; }
     adminKey = key;
     localStorage.setItem('ns_admin_key', key);
+    errEl.textContent = '';
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'block';
     refreshAll();
     autoRefreshTimer = setInterval(refreshAll, 15_000);
   } catch {
-    document.getElementById('login-error').textContent = 'Cannot connect to server';
+    errEl.textContent = 'Cannot connect to server';
   }
 }
 function doLogout() {
