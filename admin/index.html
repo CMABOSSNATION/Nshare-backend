@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetShare Admin</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3e;
+    --accent: #6c63ff;
+    --accent2: #00d4aa;
+    --red: #ff4757;
+    --text: #e8eaf0;
+    --muted: #8890aa;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+
+  /* ── Login ── */
+  #login-screen {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 20px;
+  }
+  .login-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 40px; width: 100%; max-width: 380px;
+    text-align: center;
+  }
+  .login-card h1 { font-size: 1.6rem; margin-bottom: 8px; }
+  .login-card p  { color: var(--muted); margin-bottom: 28px; font-size: 0.9rem; }
+  .login-card input {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 12px 16px; border-radius: var(--radius);
+    font-size: 1rem; margin-bottom: 14px; outline: none;
+  }
+  .login-card input:focus { border-color: var(--accent); }
+  .login-error { color: var(--red); font-size: 0.85rem; margin-bottom: 12px; min-height: 18px; }
+
+  /* ── App shell ── */
+  #app { display: none; }
+  header {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+  }
+  header h1 { font-size: 1.1rem; display: flex; align-items: center; gap: 10px; }
+  header h1 span { font-size: 1.4rem; }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); }
+  .status-dot.offline { background: var(--red); }
+
+  nav {
+    display: flex; gap: 4px; padding: 16px 24px 0;
+    border-bottom: 1px solid var(--border); background: var(--card);
+  }
+  .tab {
+    padding: 10px 20px; border: none; background: none; color: var(--muted);
+    cursor: pointer; font-size: 0.9rem; border-bottom: 2px solid transparent;
+    transition: all .2s; border-radius: 6px 6px 0 0;
+  }
+  .tab:hover  { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── Cards / Stats ── */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+  }
+  .stat-card .label { color: var(--muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em; }
+  .stat-card .value { font-size: 2rem; font-weight: 700; margin-top: 4px; }
+  .stat-card .value.green { color: var(--accent2); }
+  .stat-card .value.purple { color: var(--accent); }
+
+  /* ── Section headers ── */
+  .section-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .section-header h2 { font-size: 1rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 9px 18px; border-radius: var(--radius); border: none;
+    cursor: pointer; font-size: 0.88rem; font-weight: 600; transition: opacity .15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary  { background: var(--accent); color: #fff; }
+  .btn-green    { background: var(--accent2); color: #000; }
+  .btn-red      { background: var(--red); color: #fff; }
+  .btn-outline  { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn-sm       { padding: 5px 12px; font-size: 0.8rem; border-radius: 6px; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── Table ── */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 10px 14px;
+       border-bottom: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 11px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,.03); }
+
+  /* ── Badges ── */
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 20px;
+    font-size: 0.75rem; font-weight: 700;
+  }
+  .badge-host    { background: rgba(108,99,255,.2); color: var(--accent); }
+  .badge-client  { background: rgba(0,212,170,.2); color: var(--accent2); }
+  .badge-used    { background: rgba(255,71,87,.1); color: var(--red); }
+  .badge-active  { background: rgba(0,212,170,.15); color: var(--accent2); }
+  .badge-expired { background: rgba(255,255,255,.08); color: var(--muted); }
+
+  /* ── Code pill ── */
+  .code-pill {
+    font-family: 'Courier New', monospace; font-size: 0.95rem;
+    background: rgba(108,99,255,.1); padding: 3px 10px; border-radius: 6px;
+    color: var(--accent); letter-spacing: .05em; cursor: pointer;
+    border: 1px solid rgba(108,99,255,.3);
+  }
+  .code-pill:hover { background: rgba(108,99,255,.2); }
+
+  /* ── Modal ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); z-index: 200;
+    align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px; width: 100%; max-width: 480px;
+    position: relative;
+  }
+  .modal h2 { margin-bottom: 20px; font-size: 1.1rem; }
+  .modal-close {
+    position: absolute; top: 14px; right: 16px;
+    background: none; border: none; color: var(--muted);
+    font-size: 1.3rem; cursor: pointer;
+  }
+  .modal-close:hover { color: var(--text); }
+
+  /* ── Form controls ── */
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }
+  .form-group input, .form-group select {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 10px 14px; border-radius: var(--radius);
+    font-size: 0.9rem; outline: none;
+  }
+  .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+  .form-group select option { background: var(--card); }
+
+  /* ── Code result list ── */
+  .code-result-list {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px; max-height: 220px;
+    overflow-y: auto; margin-top: 16px;
+  }
+  .code-result-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 0; border-bottom: 1px solid var(--border);
+  }
+  .code-result-item:last-child { border-bottom: none; }
+  .copy-link-area {
+    margin-top: 12px; padding: 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .copy-link-area .link-text {
+    font-size: 0.78rem; color: var(--muted); word-break: break-all;
+    margin-bottom: 8px;
+  }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: var(--card); border: 1px solid var(--border);
+    padding: 10px 22px; border-radius: 30px; font-size: 0.88rem;
+    transition: transform .3s ease; z-index: 999; pointer-events: none;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
+
+  /* ── VPS info ── */
+  .info-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .info-chip {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 20px; padding: 6px 16px; font-size: 0.82rem;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .info-chip .lbl { color: var(--muted); }
+
+  /* ── Empty state ── */
+  .empty { text-align: center; padding: 48px; color: var(--muted); }
+  .empty .icon { font-size: 2.5rem; margin-bottom: 12px; }
+
+  /* ── Expand row ── */
+  .expand-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.85rem; }
+  .client-sub { background: rgba(0,0,0,.25); }
+  .client-sub td { padding: 8px 14px; font-size: 0.82rem; color: var(--muted); }
+
+  @media (max-width: 600px) {
+    main { padding: 16px; }
+    header { padding: 12px 16px; }
+    nav { padding: 12px 16px 0; overflow-x: auto; }
+    .tab { padding: 8px 14px; white-space: nowrap; }
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-screen">
+  <div class="login-card">
+    <h1>🔒 NetShare Admin</h1>
+    <p>Enter your admin key to continue</p>
+    <input type="password" id="admin-key-input" placeholder="Admin key" autocomplete="current-password">
+    <div class="login-error" id="login-error"></div>
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Sign in</button>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <header>
+    <h1><span>🛡️</span> NetShare Admin</h1>
+    <div class="header-right">
+      <div class="status-dot" id="status-dot" title="Server status"></div>
+      <span id="status-text" style="font-size:.82rem;color:var(--muted)">Connecting…</span>
+      <button class="btn btn-outline" style="font-size:.8rem;padding:6px 14px" onclick="doLogout()">Logout</button>
+    </div>
+  </header>
+
+  <nav>
+    <button class="tab active" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab" onclick="switchTab('codes')">Access Codes</button>
+    <button class="tab" onclick="switchTab('sessions')">Sessions</button>
+    <button class="tab" onclick="switchTab('server')">Server</button>
+  </nav>
+
+  <main>
+
+    <!-- DASHBOARD -->
+    <div id="panel-dashboard" class="panel active">
+      <div class="stats-grid" id="stats-grid">
+        <div class="stat-card"><div class="label">Active Sessions</div><div class="value green" id="st-sessions">—</div></div>
+        <div class="stat-card"><div class="label">Connected Clients</div><div class="value purple" id="st-clients">—</div></div>
+        <div class="stat-card"><div class="label">Total Codes</div><div class="value" id="st-codes">—</div></div>
+        <div class="stat-card"><div class="label">Unused Codes</div><div class="value green" id="st-unused">—</div></div>
+      </div>
+      <div class="info-row" id="info-row">
+        <div class="info-chip"><span class="lbl">Endpoint:</span><span id="info-endpoint">—</span></div>
+        <div class="info-chip"><span class="lbl">Interface:</span><span id="info-iface">—</span></div>
+        <div class="info-chip" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          <span class="lbl">Pubkey:</span><span id="info-pubkey" style="font-family:monospace;font-size:.75rem">—</span>
+        </div>
+      </div>
+      <div class="section-header">
+        <h2>Quick Actions</h2>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-primary" onclick="openModal('modal-create-code')">＋ New Host Code</button>
+        <button class="btn btn-green"   onclick="openBulkClientModal()">＋ Client Codes</button>
+        <button class="btn btn-outline" onclick="refreshAll()">↻ Refresh</button>
+      </div>
+    </div>
+
+    <!-- CODES -->
+    <div id="panel-codes" class="panel">
+      <div class="section-header">
+        <h2>Access Codes</h2>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary btn-sm" onclick="openModal('modal-create-code')">＋ Create</button>
+          <button class="btn btn-outline btn-sm" onclick="loadCodes()">↻</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Code</th><th>Type</th><th>Label</th><th>Session</th>
+            <th>Status</th><th>Expires</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="codes-tbody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- SESSIONS -->
+    <div id="panel-sessions" class="panel">
+      <div class="section-header">
+        <h2>Active Sessions</h2>
+        <button class="btn btn-outline btn-sm" onclick="loadSessions()">↻ Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Session Code</th><th>Label</th><th>IP</th>
+            <th>Clients</th><th>Uptime</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="sessions-tbody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- SERVER -->
+    <div id="panel-server" class="panel">
+      <div class="section-header"><h2>Server Info</h2></div>
+      <div id="server-info-panel" style="display:flex;flex-direction:column;gap:14px;max-width:600px"></div>
+      <div style="margin-top:24px;display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-outline" onclick="restartWg()">⟳ Restart WireGuard</button>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ── Create Code Modal ── -->
+<div class="modal-overlay" id="modal-create-code">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal('modal-create-code')">✕</button>
+    <h2>Create Access Code</h2>
+    <div class="form-group">
+      <label>Type</label>
+      <select id="cc-type" onchange="onTypeChange()">
+        <option value="host">Host (new session)</option>
+        <option value="client">Client (join existing session)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Label (optional)</label>
+      <input type="text" id="cc-label" placeholder="e.g. John's phone">
+    </div>
+    <div class="form-group" id="cc-session-group" style="display:none">
+      <label>Session Code (required for client codes)</label>
+      <select id="cc-session">
+        <option value="">— select session —</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>How many codes?</label>
+      <input type="number" id="cc-count" value="1" min="1" max="50">
+    </div>
+    <div class="form-group">
+      <label>Expires in (hours, blank = never)</label>
+      <input type="number" id="cc-expires" placeholder="e.g. 24">
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="createCode()">Create Code(s)</button>
+    <div id="cc-result"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+const BASE = window.location.origin;
+let adminKey = '';
+let autoRefreshTimer = null;
+
+// ── Auth ──────────────────────────────────────────────────────────────
+async function doLogin() {
+  const key = document.getElementById('admin-key-input').value.trim();
+  if (!key) return;
+  try {
+    const r = await apiFetch('/admin/stats', {}, key);
+    if (r.error) { document.getElementById('login-error').textContent = 'Wrong admin key'; return; }
+    adminKey = key;
+    localStorage.setItem('ns_admin_key', key);
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    refreshAll();
+    autoRefreshTimer = setInterval(refreshAll, 15_000);
+  } catch {
+    document.getElementById('login-error').textContent = 'Cannot connect to server';
+  }
+}
+function doLogout() {
+  adminKey = '';
+  localStorage.removeItem('ns_admin_key');
+  clearInterval(autoRefreshTimer);
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('admin-key-input').value = '';
+}
+document.getElementById('admin-key-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+// Auto-restore session
+window.addEventListener('load', () => {
+  const saved = localStorage.getItem('ns_admin_key');
+  if (saved) { document.getElementById('admin-key-input').value = saved; doLogin(); }
+});
+
+// ── API ───────────────────────────────────────────────────────────────
+async function apiFetch(path, opts = {}, key = adminKey) {
+  const res = await fetch(BASE + path, {
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': key },
+    ...opts,
+  });
+  return res.json();
+}
+
+// ── Tab switching ──────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+  if (name === 'codes')    loadCodes();
+  if (name === 'sessions') loadSessions();
+  if (name === 'server')   loadServerInfo();
+}
+
+// ── Refresh ────────────────────────────────────────────────────────────
+async function refreshAll() {
+  await loadStats();
+  const active = document.querySelector('.panel.active');
+  if (active?.id === 'panel-codes')    loadCodes();
+  if (active?.id === 'panel-sessions') loadSessions();
+  if (active?.id === 'panel-server')   loadServerInfo();
+}
+
+async function loadStats() {
+  try {
+    const s = await apiFetch('/admin/stats');
+    document.getElementById('st-sessions').textContent = s.activeSessions ?? 0;
+    document.getElementById('st-clients').textContent  = s.totalClients   ?? 0;
+    document.getElementById('st-codes').textContent    = s.totalCodes     ?? 0;
+    document.getElementById('st-unused').textContent   = s.unusedCodes    ?? 0;
+    document.getElementById('info-endpoint').textContent = s.vpsEndpoint  || '(not set)';
+    document.getElementById('info-iface').textContent    = s.wgInterface  || 'wg0';
+    document.getElementById('info-pubkey').textContent   = s.serverPubkey || '—';
+    setOnline(true);
+  } catch { setOnline(false); }
+}
+
+function setOnline(on) {
+  document.getElementById('status-dot').className  = 'status-dot' + (on ? '' : ' offline');
+  document.getElementById('status-text').textContent = on ? 'Online' : 'Offline';
+}
+
+// ── Codes ─────────────────────────────────────────────────────────────
+async function loadCodes() {
+  const tbody = document.getElementById('codes-tbody');
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">Loading…</td></tr>';
+  const codes = await apiFetch('/admin/codes');
+  if (!codes.length) { tbody.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="icon">🔑</div>No codes yet</div></td></tr>'; return; }
+  tbody.innerHTML = codes.map(c => {
+    const statusBadge = c.used ? '<span class="badge badge-used">Used</span>'
+      : c.expired ? '<span class="badge badge-expired">Expired</span>'
+      : '<span class="badge badge-active">Active</span>';
+    const expires = c.expiresAt ? new Date(c.expiresAt).toLocaleString() : '—';
+    const shareUrl = `${BASE}/download.html?code=${c.code}`;
+    return `<tr>
+      <td><span class="code-pill" onclick="copyText('${c.code}')" title="Click to copy">${c.code}</span></td>
+      <td><span class="badge badge-${c.type}">${c.type.toUpperCase()}</span></td>
+      <td>${esc(c.label||'')}</td>
+      <td>${c.sessionCode ? `<span class="code-pill" style="font-size:.8rem">${c.sessionCode}</span>` : '—'}</td>
+      <td>${statusBadge}</td>
+      <td style="font-size:.8rem;color:var(--muted)">${expires}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn btn-outline btn-sm" onclick="copyText('${shareUrl}')">📋 Link</button>
+        <button class="btn btn-red btn-sm" onclick="deleteCode('${c.code}')">✕</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function deleteCode(code) {
+  if (!confirm(`Delete code ${code}?`)) return;
+  await apiFetch(`/admin/codes/${code}`, { method: 'DELETE' });
+  toast('Code deleted');
+  loadCodes();
+  loadStats();
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────
+async function loadSessions() {
+  const tbody = document.getElementById('sessions-tbody');
+  tbody.innerHTML = '<tr><td colspan="6" class="empty">Loading…</td></tr>';
+  const sessions = await apiFetch('/admin/sessions');
+  if (!sessions.length) { tbody.innerHTML = '<tr><td colspan="6"><div class="empty"><div class="icon">🌐</div>No active sessions</div></td></tr>'; return; }
+  tbody.innerHTML = sessions.map(s => {
+    const clients = [...(s.clientList||[])];
+    const clientRows = clients.map(c =>
+      `<tr class="client-sub" id="sub-${s.sessionId}">
+        <td colspan="2" style="padding-left:36px">👤 ${esc(c.label||c.clientId.slice(0,8))}</td>
+        <td>${c.ip}</td>
+        <td>${fmtBytes(c.stats?.rx||0)} ↓ / ${fmtBytes(c.stats?.tx||0)} ↑</td>
+        <td colspan="2"><button class="btn btn-red btn-sm" onclick="kickClient('${s.sessionId}','${c.clientId}')">Kick</button></td>
+      </tr>`).join('');
+    return `<tr>
+      <td><span class="code-pill" onclick="copyText('${s.sessionCode}')">${s.sessionCode}</span></td>
+      <td>${esc(s.label||'Host')}</td>
+      <td style="font-family:monospace;font-size:.82rem">${s.ip}</td>
+      <td>${s.clients}</td>
+      <td style="color:var(--muted);font-size:.82rem">${s.ageMinutes}m</td>
+      <td style="display:flex;gap:6px">
+        ${s.clients>0?`<button class="btn btn-outline btn-sm" onclick="toggleClients('${s.sessionId}')">Clients ▾</button>`:''}
+        <button class="btn btn-red btn-sm" onclick="killSession('${s.sessionId}')">End</button>
+      </td>
+    </tr>${clientRows}`;
+  }).join('');
+  // Hide client rows initially
+  document.querySelectorAll('[id^="sub-"]').forEach(r => r.style.display='none');
+}
+
+function toggleClients(id) {
+  document.querySelectorAll(`#sub-${id}`).forEach(r => {
+    r.style.display = r.style.display === 'none' ? '' : 'none';
+  });
+}
+
+async function killSession(id) {
+  if (!confirm('End this session? All clients will be disconnected.')) return;
+  await apiFetch(`/admin/sessions/${id}`, { method: 'DELETE' });
+  toast('Session ended');
+  loadSessions(); loadStats();
+}
+
+async function kickClient(sessionId, clientId) {
+  if (!confirm('Kick this client?')) return;
+  await apiFetch(`/admin/sessions/${sessionId}/clients/${clientId}`, { method: 'DELETE' });
+  toast('Client kicked');
+  loadSessions();
+}
+
+// ── Server info ────────────────────────────────────────────────────────
+async function loadServerInfo() {
+  const s = await apiFetch('/admin/stats');
+  const panel = document.getElementById('server-info-panel');
+  panel.innerHTML = [
+    row('VPS Endpoint', s.vpsEndpoint || '⚠️ NOT SET — set VPS_ENDPOINT env var'),
+    row('WireGuard Interface', s.wgInterface),
+    row('Server Public Key', `<span style="font-family:monospace;font-size:.82rem;word-break:break-all">${s.serverPubkey}</span>`),
+    row('Active Sessions', s.activeSessions),
+    row('Connected Clients', s.totalClients),
+  ].join('');
+}
+
+function row(label, val) {
+  return `<div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+    <span style="color:var(--muted);font-size:.82rem;min-width:160px">${label}</span>
+    <span>${val}</span>
+  </div>`;
+}
+
+async function restartWg() {
+  if (!confirm('Restart WireGuard interface? Active connections will briefly drop.')) return;
+  const r = await apiFetch('/admin/wg/restart', { method: 'POST' });
+  toast(r.ok ? 'WireGuard restarted' : 'Error: ' + r.error);
+}
+
+// ── Create code modal ──────────────────────────────────────────────────
+async function onTypeChange() {
+  const type  = document.getElementById('cc-type').value;
+  const group = document.getElementById('cc-session-group');
+  group.style.display = type === 'client' ? '' : 'none';
+  if (type === 'client') {
+    // Populate session list
+    const sessions = await apiFetch('/admin/sessions');
+    const sel = document.getElementById('cc-session');
+    sel.innerHTML = sessions.map(s =>
+      `<option value="${s.sessionCode}">${s.sessionCode} — ${esc(s.label||'Host')} (${s.clients} clients)</option>`
+    ).join('') || '<option value="">No active sessions</option>';
+  }
+}
+
+async function createCode() {
+  const type    = document.getElementById('cc-type').value;
+  const label   = document.getElementById('cc-label').value.trim();
+  const session = document.getElementById('cc-session').value;
+  const count   = parseInt(document.getElementById('cc-count').value) || 1;
+  const expires = parseInt(document.getElementById('cc-expires').value) || null;
+
+  if (type === 'client' && !session) { alert('Select a session code'); return; }
+
+  const body = { type, label, count, expiresInHours: expires };
+  if (type === 'client') body.sessionCode = session;
+
+  const r = await apiFetch('/admin/codes/create', {
+    method: 'POST', body: JSON.stringify(body),
+  });
+
+  if (r.error) { alert(r.error); return; }
+
+  // Show results
+  const resultDiv = document.getElementById('cc-result');
+  resultDiv.innerHTML = `<div class="code-result-list">` +
+    r.created.map(code => {
+      const url = `${BASE}/download?code=${code}`;
+      return `<div class="code-result-item">
+        <span class="code-pill" onclick="copyText('${code}')">${code}</span>
+        <button class="btn btn-outline btn-sm" onclick="copyText('${url}')">📋 Copy Link</button>
+      </div>`;
+    }).join('') + '</div>';
+
+  toast(`${r.count} code(s) created`);
+  loadCodes(); loadStats();
+}
+
+function openBulkClientModal() {
+  document.getElementById('cc-type').value = 'client';
+  onTypeChange();
+  openModal('modal-create-code');
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────
+function openModal(id) {
+  document.getElementById(id).classList.add('open');
+  document.getElementById('cc-result').innerHTML = '';
+}
+function closeModal(id) { document.getElementById(id).classList.remove('open'); }
+document.querySelectorAll('.modal-overlay').forEach(m => {
+  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); });
+});
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function esc(s) { return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtBytes(b) {
+  if (b < 1024) return b + 'B';
+  if (b < 1048576) return (b/1024).toFixed(1) + 'KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + 'MB';
+  return (b/1073741824).toFixed(2) + 'GB';
+}
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast('Copied!')).catch(() => {
+    const el = document.createElement('textarea');
+    el.value = text; document.body.appendChild(el); el.select();
+    document.execCommand('copy'); document.body.removeChild(el);
+    toast('Copied!');
+  });
+}
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+</script>
+</body>
+</html>
