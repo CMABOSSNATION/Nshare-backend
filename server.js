@@ -523,3 +523,32 @@ server.listen(PORT, () => {
   console.log('╚══════════════════════════════════════════════╝');
   if (!VPS_ENDPOINT) console.warn('[WARN] VPS_ENDPOINT not set! Set it to your public IP:51820');
 });
+
+// ── Auto-disconnect expired sessions ─────────────────────────────────
+async function checkExpiredSessions() {
+  const now = Date.now();
+  for (const [code, rec] of codes.entries()) {
+    if (!rec.expiresAt || now <= rec.expiresAt) continue;
+
+    if (rec.type === 'host' && rec.sessionId) {
+      console.log(`[EXPIRE] Host code ${code} expired — tearing down session`);
+      await teardownSession(rec.sessionId);
+      saveData();
+    }
+
+    if (rec.type === 'client' && rec.sessionId && rec.clientId) {
+      const sess = sessions.get(rec.sessionId);
+      if (sess) {
+        const client = sess.clients.get(rec.clientId);
+        if (client) {
+          console.log(`[EXPIRE] Client code ${code} expired — kicking client`);
+          await wgRemovePeer(client.publicKey);
+          freeIp(client.ip);
+          sess.clients.delete(rec.clientId);
+          saveData();
+        }
+      }
+    }
+  }
+}
+setInterval(checkExpiredSessions, 60_000);
