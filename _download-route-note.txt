@@ -1,4 +1,0 @@
-// Add this to server.js after the cors/json middleware lines:
-// app.use('/download', express.static(path.join(__dirname, 'download.html')));
-// OR — simpler, add one route:
-// app.get('/download', (_, res) => res.sendFile(path.join(__dirname, 'download.html')));
