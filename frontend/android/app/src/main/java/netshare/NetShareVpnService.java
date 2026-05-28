@@ -19,6 +19,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
+import java.security.Security;
 import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,6 +38,19 @@ public class NetShareVpnService extends VpnService {
     private static final int WG_KEEPALIVE_MS   = 25_000;
     private static final int WG_REKEY_AFTER_MS = 180_000;
     private static final int RECONNECT_MAX_MS  = 30_000;
+
+    // ── Install Conscrypt once at class load ───────────────────────────
+    static {
+        try {
+            Class<?> conscrypt = Class.forName("org.conscrypt.Conscrypt");
+            java.security.Provider provider =
+                (java.security.Provider) conscrypt.getMethod("newProvider").invoke(null);
+            Security.insertProviderAt(provider, 1);
+            Log.i("NetShareVPN", "Conscrypt installed as security provider");
+        } catch (Exception e) {
+            Log.w("NetShareVPN", "Conscrypt not available, using default providers: " + e.getMessage());
+        }
+    }
 
     // ── Debug log ──────────────────────────────────────────────────────
     private static final int MAX_DEBUG_LINES = 200;
@@ -148,7 +162,6 @@ public class NetShareVpnService extends VpnService {
     private void doConnect() throws Exception {
         dbg("Connecting to " + serverEndpoint);
 
-        // Build TUN interface
         Builder builder = new Builder();
         builder.setSession("NetShare")
                .addAddress(clientIp, 24)
@@ -175,7 +188,6 @@ public class NetShareVpnService extends VpnService {
         if (vpnInterface == null) throw new IOException("VPN establish() returned null — permission revoked?");
         dbg("TUN up, ip=" + clientIp);
 
-        // UDP socket to VPS
         String[] parts = serverEndpoint.split(":");
         InetAddress addr = InetAddress.getByName(parts[0]);
         int port = Integer.parseInt(parts[1]);
@@ -187,7 +199,6 @@ public class NetShareVpnService extends VpnService {
         wgChannel.socket().setSoTimeout(500);
         wgChannel.connect(new InetSocketAddress(addr, port));
 
-        // WireGuard handshake
         wgSession = new WireGuardSession(clientPrivateKey, clientPublicKey, serverPublicKey, wgChannel);
         if (!wgSession.doHandshake()) throw new IOException("WireGuard handshake failed after 5 attempts");
         dbg("Handshake OK");
@@ -326,6 +337,7 @@ public class NetShareVpnService extends VpnService {
 
     // ════════════════════════════════════════════════════════════════════
     // WireGuardSession — Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s
+    // All crypto uses Conscrypt (X25519) + pure-Java Blake2s (no BouncyCastle)
     // ════════════════════════════════════════════════════════════════════
 
     private static class WireGuardSession {
@@ -441,7 +453,7 @@ public class NetShareVpnService extends VpnService {
             msg.put(encS);
             msg.put(encTs);
             msg.put(mac1);
-            msg.put(new byte[16]); // mac2 zero
+            msg.put(new byte[16]);
             return msg.array();
         }
 
@@ -499,7 +511,7 @@ public class NetShareVpnService extends VpnService {
 
         byte[] buildKeepalive() { return encryptTransport(new byte[0], 0, 0); }
 
-        // ── Crypto ────────────────────────────────────────────────────
+        // ── Crypto — Conscrypt for X25519, pure-Java for Blake2s ──────
 
         private static byte[] aeadEncrypt(byte[] key, long counter, byte[] pt, byte[] aad) throws Exception {
             javax.crypto.Cipher c = javax.crypto.Cipher.getInstance("ChaCha20-Poly1305");
@@ -525,40 +537,44 @@ public class NetShareVpnService extends VpnService {
             return n;
         }
 
+        // X25519 via Conscrypt — works on all Android versions with no conflicts
         private static byte[] x25519(byte[] priv, byte[] pub) throws Exception {
-            if (Build.VERSION.SDK_INT >= 33) {
-                java.security.KeyFactory kf = java.security.KeyFactory.getInstance("XDH");
-                java.security.spec.NamedParameterSpec spec = new java.security.spec.NamedParameterSpec("X25519");
-                java.security.PrivateKey privKey = kf.generatePrivate(
-                    new java.security.spec.XECPrivateKeySpec(spec, priv.clone()));
-                java.security.PublicKey pubKey = kf.generatePublic(
-                    new java.security.spec.XECPublicKeySpec(spec,
-                        new java.math.BigInteger(1, reverseBytes(pub))));
-                javax.crypto.KeyAgreement ka = javax.crypto.KeyAgreement.getInstance("XDH");
-                ka.init(privKey);
-                ka.doPhase(pubKey, true);
-                return ka.generateSecret();
-            }
-            return x25519ViaBouncy(priv, pub);
-        }
+            javax.crypto.KeyAgreement ka = javax.crypto.KeyAgreement.getInstance("X25519");
+            java.security.KeyFactory  kf = java.security.KeyFactory.getInstance("X25519");
 
-        private static byte[] x25519ViaBouncy(byte[] priv, byte[] pub) throws Exception {
-            Class<?> cls     = Class.forName("org.bouncycastle.crypto.agreement.X25519Agreement");
-            Class<?> privCls = Class.forName("org.bouncycastle.crypto.params.X25519PrivateKeyParameters");
-            Class<?> pubCls  = Class.forName("org.bouncycastle.crypto.params.X25519PublicKeyParameters");
-            Class<?> cipCls  = Class.forName("org.bouncycastle.crypto.CipherParameters");
-            Object   ag      = cls.getDeclaredConstructor().newInstance();
-            Object   privP   = privCls.getDeclaredConstructor(byte[].class, int.class).newInstance(priv, 0);
-            Object   pubP    = pubCls.getDeclaredConstructor(byte[].class, int.class).newInstance(pub, 0);
-            cls.getMethod("init", cipCls).invoke(ag, privP);
-            byte[] out = new byte[32];
-            cls.getMethod("calculateAgreement", cipCls, byte[].class, int.class).invoke(ag, pubP, out, 0);
-            return out;
+            // Encode private key as PKCS8
+            // X25519 PKCS8 prefix: 302e020100300506032b656e04220420
+            byte[] pkcs8Prefix = new byte[]{
+                0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+                0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20
+            };
+            byte[] pkcs8 = new byte[pkcs8Prefix.length + 32];
+            System.arraycopy(pkcs8Prefix, 0, pkcs8, 0, pkcs8Prefix.length);
+            System.arraycopy(priv, 0, pkcs8, pkcs8Prefix.length, 32);
+            java.security.PrivateKey privKey = kf.generatePrivate(
+                new java.security.spec.PKCS8EncodedKeySpec(pkcs8));
+
+            // Encode public key as X.509 SubjectPublicKeyInfo
+            // X25519 SubjectPublicKeyInfo prefix: 302a300506032b656e032100
+            byte[] spkiPrefix = new byte[]{
+                0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+                0x6e, 0x03, 0x21, 0x00
+            };
+            byte[] spki = new byte[spkiPrefix.length + 32];
+            System.arraycopy(spkiPrefix, 0, spki, 0, spkiPrefix.length);
+            System.arraycopy(pub, 0, spki, spkiPrefix.length, 32);
+            java.security.PublicKey pubKey = kf.generatePublic(
+                new java.security.spec.X509EncodedKeySpec(spki));
+
+            ka.init(privKey);
+            ka.doPhase(pubKey, true);
+            return ka.generateSecret();
         }
 
         private static byte[] x25519PublicKey(byte[] priv) throws Exception {
+            // Derive public key by multiplying with base point via x25519(priv, G)
             byte[] basePoint = new byte[32];
-            basePoint[0] = 9; // Curve25519 base point u = 9
+            basePoint[0] = 9;
             return x25519(priv, basePoint);
         }
 
@@ -571,24 +587,14 @@ public class NetShareVpnService extends VpnService {
             return key;
         }
 
+        // ── Pure-Java Blake2s (no external dependency) ─────────────────
+        // Implements BLAKE2s-256 per RFC 7693
         private static byte[] blake2s(byte[] data) throws Exception {
-            try {
-                Class<?> cls = Class.forName("org.bouncycastle.crypto.digests.Blake2sDigest");
-                Object d = cls.getDeclaredConstructor(int.class).newInstance(256);
-                cls.getMethod("update", byte[].class, int.class, int.class).invoke(d, data, 0, data.length);
-                byte[] out = new byte[32];
-                cls.getMethod("doFinal", byte[].class, int.class).invoke(d, out, 0);
-                return out;
-            } catch (ClassNotFoundException e) {
-                // Fallback to SHA-256 if Bouncy Castle not available (handshake will fail vs strict WG)
-                return java.security.MessageDigest.getInstance("SHA-256").digest(data);
-            }
+            return Blake2s.hash(data);
         }
 
         private static byte[] blake2sMac(byte[] key, byte[] data) throws Exception {
-            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"));
-            return Arrays.copyOf(mac.doFinal(data), 16);
+            return Blake2s.mac(key, data, 16);
         }
 
         private static byte[] hkdf1(byte[] salt, byte[] ikm) throws Exception {
@@ -645,6 +651,124 @@ public class NetShareVpnService extends VpnService {
 
         private static int bytesToInt(byte[] b, int offset) {
             return Integer.reverseBytes(ByteBuffer.wrap(b, offset, 4).getInt());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Pure-Java BLAKE2s-256 implementation — RFC 7693
+    // No external dependencies. Works on all Android versions.
+    // ════════════════════════════════════════════════════════════════════
+
+    static final class Blake2s {
+
+        private static final int[] IV = {
+            0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+            0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+        };
+
+        private static final byte[] SIGMA = {
+             0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15,
+            14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3,
+            11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4,
+             7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8,
+             9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13,
+             2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9,
+            12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11,
+            13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10,
+             6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5,
+            10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0,
+        };
+
+        /** Hash data with BLAKE2s-256, output = 32 bytes */
+        static byte[] hash(byte[] data) throws Exception {
+            return compress(null, data, 32);
+        }
+
+        /** MAC with BLAKE2s, output truncated to outLen bytes */
+        static byte[] mac(byte[] key, byte[] data, int outLen) throws Exception {
+            return compress(key, data, outLen);
+        }
+
+        private static byte[] compress(byte[] key, byte[] data, int outLen) {
+            int[] h = IV.clone();
+            // Parameter block: outLen | keyLen | fanout=1 | depth=1
+            int keyLen = (key != null) ? key.length : 0;
+            h[0] ^= 0x01010000 ^ (keyLen << 8) ^ outLen;
+
+            // If keyed, prepend key block (64 bytes, key zero-padded)
+            byte[] input;
+            if (key != null && keyLen > 0) {
+                input = new byte[64 + data.length];
+                System.arraycopy(key, 0, input, 0, keyLen);
+                System.arraycopy(data, 0, input, 64, data.length);
+            } else {
+                input = data;
+            }
+
+            int len = input.length;
+            int blocks = Math.max(1, (len + 63) / 64);
+
+            for (int b = 0; b < blocks; b++) {
+                byte[] block = new byte[64];
+                int offset = b * 64;
+                int copyLen = Math.min(64, len - offset);
+                if (copyLen > 0) System.arraycopy(input, offset, block, 0, copyLen);
+
+                long counter = (long) Math.min(len, (b + 1) * 64);
+                boolean last = (b == blocks - 1);
+                h = mixBlock(h, block, counter, last);
+            }
+
+            byte[] out = new byte[outLen];
+            for (int i = 0; i < outLen; i++) {
+                out[i] = (byte)((h[i / 4] >>> (8 * (i % 4))) & 0xFF);
+            }
+            return out;
+        }
+
+        private static int[] mixBlock(int[] h, byte[] block, long t, boolean last) {
+            int[] m = new int[16];
+            for (int i = 0; i < 16; i++) {
+                m[i] = (block[i*4] & 0xFF)
+                     | ((block[i*4+1] & 0xFF) << 8)
+                     | ((block[i*4+2] & 0xFF) << 16)
+                     | ((block[i*4+3] & 0xFF) << 24);
+            }
+
+            int[] v = new int[16];
+            System.arraycopy(h, 0, v, 0, 8);
+            System.arraycopy(IV, 0, v, 8, 8);
+            v[12] ^= (int)(t & 0xFFFFFFFFL);
+            v[13] ^= (int)(t >>> 32);
+            if (last) v[14] ^= 0xFFFFFFFF;
+
+            for (int r = 0; r < 10; r++) {
+                byte[] s = Arrays.copyOfRange(SIGMA, r * 16, r * 16 + 16);
+                v = G(v, 0, 4,  8, 12, m[s[0]&0xFF],  m[s[1]&0xFF]);
+                v = G(v, 1, 5,  9, 13, m[s[2]&0xFF],  m[s[3]&0xFF]);
+                v = G(v, 2, 6, 10, 14, m[s[4]&0xFF],  m[s[5]&0xFF]);
+                v = G(v, 3, 7, 11, 15, m[s[6]&0xFF],  m[s[7]&0xFF]);
+                v = G(v, 0, 5, 10, 15, m[s[8]&0xFF],  m[s[9]&0xFF]);
+                v = G(v, 1, 6, 11, 12, m[s[10]&0xFF], m[s[11]&0xFF]);
+                v = G(v, 2, 7,  8, 13, m[s[12]&0xFF], m[s[13]&0xFF]);
+                v = G(v, 3, 4,  9, 14, m[s[14]&0xFF], m[s[15]&0xFF]);
+            }
+
+            int[] newH = h.clone();
+            for (int i = 0; i < 8; i++) newH[i] ^= v[i] ^ v[i + 8];
+            return newH;
+        }
+
+        private static int[] G(int[] v, int a, int b, int c, int d, int x, int y) {
+            v[a] = v[a] + v[b] + x;
+            v[d] = Integer.rotateRight(v[d] ^ v[a], 16);
+            v[c] = v[c] + v[d];
+            v[b] = Integer.rotateRight(v[b] ^ v[c], 12);
+            v[a] = v[a] + v[b] + y;
+            v[d] = Integer.rotateRight(v[d] ^ v[a], 8);
+            v[c] = v[c] + v[d];
+            v[b] = Integer.rotateRight(v[b] ^ v[c], 7);
+            return v;
         }
     }
 }
