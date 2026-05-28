@@ -206,6 +206,14 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+
+// ── Admin login endpoint ──────────────────────────────────────────────
+app.post('/admin/login', (req, res) => {
+  const key = req.body?.key || req.body?.password || '';
+  if (key === ADMIN_KEY) return res.json({ ok: true });
+  return res.status(401).json({ error: 'Wrong admin key' });
+});
+
 // ── Health ────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   ok: true,
@@ -450,7 +458,8 @@ app.delete('/admin/sessions/:id/clients/:clientId', requireAdmin, async (req, re
 app.get('/admin/stats', requireAdmin, async (req, res) => {
   const stats = await wgStats();
   let totalRx = 0, totalTx = 0;
-  for (const s of stats) { totalRx += s.rx || 0; totalTx += s.tx || 0; }
+  // wgStats returns an object keyed by pubkey, not an array
+  for (const s of Object.values(stats)) { totalRx += s.rx || 0; totalTx += s.tx || 0; }
   res.json({
     activeSessions: [...sessions.values()].filter(s => s.active).length,
     totalClients:   [...sessions.values()].reduce((n, s) => n + s.clients.size, 0),
