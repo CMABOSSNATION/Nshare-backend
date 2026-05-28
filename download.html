@@ -91,7 +91,7 @@
   <p class="sub">Enter your access code to download your WireGuard config</p>
 
   <div class="code-input-wrap">
-    <input type="text" id="code-input" maxlength="9" placeholder="XXXX-XXXX" oninput="onCodeInput(this)">
+    <input type="text" id="code-input" maxlength="10" placeholder="XXXX-XXXX" oninput="onCodeInput(this)">
   </div>
   <button class="btn btn-primary" id="check-btn" onclick="checkCode()">Check Code</button>
 
@@ -120,7 +120,7 @@ function onCodeInput(el) {
 
 async function checkCode() {
   const code = document.getElementById('code-input').value.trim().toUpperCase();
-  if (code.length < 9) { showError('Please enter a valid code (format: XXXX-XXXX)'); return; }
+  if (code.length < 10) { showError('Please enter a valid code (format: HXXXX-XXXX)'); return; }
 
   showStatus('spinner', 'Checking code…');
   document.getElementById('result-area').innerHTML = '';
