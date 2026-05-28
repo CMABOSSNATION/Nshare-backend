@@ -1,0 +1,16 @@
+{
+  "name": "netshare-relay",
+  "version": "2.0.0",
+  "description": "NetShare VPS relay — WireGuard + admin panel edition",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev":   "node --watch server.js",
+    "pm2":   "pm2 start ecosystem.config.cjs"
+  },
+  "dependencies": {
+    "cors":    "^2.8.5",
+    "express": "^4.19.2",
+    "ws":      "^8.18.0"
+  }
+}

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NetShare — Get Connected</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #1a1d27; --border: #2a2d3e;
+    --accent: #6c63ff; --green: #00d4aa; --red: #ff4757;
+    --text: #e8eaf0; --muted: #8890aa; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 24px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 36px 32px;
+    width: 100%; max-width: 460px; text-align: center;
+  }
+  .logo { font-size: 3rem; margin-bottom: 12px; }
+  h1   { font-size: 1.5rem; margin-bottom: 6px; }
+  .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 28px; }
+
+  .code-input-wrap { display: flex; gap: 10px; margin-bottom: 20px; }
+  input[type=text] {
+    flex: 1; background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); padding: 12px 16px; border-radius: var(--radius);
+    font-size: 1rem; outline: none; text-transform: uppercase; letter-spacing: .1em;
+    text-align: center;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+
+  .btn {
+    padding: 12px 22px; border-radius: var(--radius); border: none;
+    cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: opacity .15s;
+  }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: var(--accent); color: #fff; width: 100%; }
+  .btn-green   { background: var(--green);  color: #000; width: 100%; font-size: 1rem; padding: 14px; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  .status { min-height: 44px; display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 20px; }
+  .spinner {
+    width: 20px; height: 20px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .type-badge {
+    display: inline-block; padding: 4px 16px; border-radius: 20px;
+    font-size: .8rem; font-weight: 700; margin-bottom: 16px;
+  }
+  .type-host   { background: rgba(108,99,255,.2); color: var(--accent); }
+  .type-client { background: rgba(0,212,170,.2);  color: var(--green); }
+
+  .steps {
+    text-align: left; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px; margin-top: 20px;
+  }
+  .steps h3 { font-size: .85rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 12px; }
+  .step { display: flex; gap: 12px; margin-bottom: 10px; font-size: .88rem; }
+  .step-n {
+    width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    font-size: .75rem; font-weight: 700; flex-shrink: 0;
+  }
+  .store-links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .store-link {
+    padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--muted); font-size: .8rem; text-decoration: none;
+  }
+  .store-link:hover { color: var(--text); border-color: var(--accent); }
+
+  .error-box {
+    background: rgba(255,71,87,.1); border: 1px solid rgba(255,71,87,.3);
+    border-radius: var(--radius); padding: 14px; color: var(--red); font-size: .88rem;
+  }
+  footer { margin-top: 28px; color: var(--muted); font-size: .78rem; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="logo">🛡️</div>
+  <h1>NetShare</h1>
+  <p class="sub">Enter your access code to download your WireGuard config</p>
+
+  <div class="code-input-wrap">
+    <input type="text" id="code-input" maxlength="9" placeholder="XXXX-XXXX" oninput="onCodeInput(this)">
+  </div>
+  <button class="btn btn-primary" id="check-btn" onclick="checkCode()">Check Code</button>
+
+  <div class="status" id="status-area" style="display:none"></div>
+  <div id="result-area"></div>
+</div>
+
+<footer>NetShare by Clean Money Avenue Media &amp; Technology Ltd</footer>
+
+<script>
+const BASE = window.location.origin;
+
+// Pre-fill from URL param
+window.addEventListener('load', () => {
+  const params = new URLSearchParams(location.search);
+  const code   = params.get('code');
+  if (code) {
+    document.getElementById('code-input').value = code.toUpperCase();
+    checkCode();
+  }
+});
+
+function onCodeInput(el) {
+  el.value = el.value.toUpperCase().replace(/[^A-Z0-9-]/g, '');
+}
+
+async function checkCode() {
+  const code = document.getElementById('code-input').value.trim().toUpperCase();
+  if (code.length < 9) { showError('Please enter a valid code (format: XXXX-XXXX)'); return; }
+
+  showStatus('spinner', 'Checking code…');
+  document.getElementById('result-area').innerHTML = '';
+
+  try {
+    const r = await fetch(`${BASE}/config/info?code=${encodeURIComponent(code)}`);
+    const info = await r.json();
+    if (!info.valid) { showError(info.reason || 'Invalid code'); return; }
+    showCodeInfo(code, info);
+  } catch (e) {
+    showError('Cannot reach server. Try again.');
+  }
+}
+
+function showCodeInfo(code, info) {
+  document.getElementById('status-area').style.display = 'none';
+  const typeLabel = info.type === 'host' ? 'HOST' : 'CLIENT';
+  const typeClass = info.type === 'host' ? 'type-host' : 'type-client';
+
+  document.getElementById('result-area').innerHTML = `
+    <div style="margin-top:20px">
+      <span class="type-badge ${typeClass}">${typeLabel}</span>
+      ${info.label ? `<p style="color:var(--muted);font-size:.88rem;margin-bottom:16px">${esc(info.label)}</p>` : ''}
+      <button class="btn btn-green" onclick="downloadConfig('${code}')">
+        ⬇️ Download WireGuard Config
+      </button>
+      <div class="steps">
+        <h3>How to connect</h3>
+        <div class="step"><div class="step-n">1</div><div>Download and install the <strong>WireGuard app</strong></div></div>
+        <div class="store-links">
+          <a class="store-link" href="https://play.google.com/store/apps/details?id=com.wireguard.android" target="_blank">▶ Google Play</a>
+          <a class="store-link" href="https://apps.apple.com/app/wireguard/id1441195209" target="_blank">🍎 App Store</a>
+          <a class="store-link" href="https://www.wireguard.com/install/" target="_blank">💻 Desktop</a>
+        </div>
+        <div class="step" style="margin-top:10px"><div class="step-n">2</div><div>Tap the button above to download your <code>.conf</code> file</div></div>
+        <div class="step"><div class="step-n">3</div><div>In WireGuard app → tap <strong>+</strong> → <strong>Import from file</strong> → select the downloaded file</div></div>
+        <div class="step"><div class="step-n">4</div><div>Toggle the tunnel ON — you're connected! 🎉</div></div>
+      </div>
+    </div>`;
+}
+
+async function downloadConfig(code) {
+  showStatus('spinner', 'Generating your config…');
+  try {
+    const r = await fetch(`${BASE}/config?code=${encodeURIComponent(code)}`);
+    if (!r.ok) {
+      const err = await r.json();
+      showError(err.error || 'Failed to generate config');
+      return;
+    }
+    // Trigger download
+    const blob = await r.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    const cd   = r.headers.get('Content-Disposition') || '';
+    const name = cd.match(/filename="([^"]+)"/)?.[1] || `netshare-${code}.conf`;
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+    document.getElementById('status-area').style.display = 'none';
+    document.getElementById('result-area').innerHTML += `
+      <div style="margin-top:16px;padding:12px 16px;background:rgba(0,212,170,.1);border:1px solid rgba(0,212,170,.3);border-radius:10px;font-size:.88rem;color:var(--green)">
+        ✅ Config downloaded! Open WireGuard app and import the file.
+      </div>`;
+  } catch (e) {
+    showError('Download failed: ' + e.message);
+  }
+}
+
+function showStatus(type, msg) {
+  const area = document.getElementById('status-area');
+  area.style.display = 'flex';
+  area.innerHTML = type === 'spinner'
+    ? `<div class="spinner"></div><span style="color:var(--muted)">${msg}</span>`
+    : `<span>${msg}</span>`;
+}
+
+function showError(msg) {
+  document.getElementById('status-area').style.display = 'none';
+  document.getElementById('result-area').innerHTML = `<div class="error-box" style="margin-top:16px">${esc(msg)}</div>`;
+}
+
+function esc(s) {
+  return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+</body>
+</html>
