@@ -15,9 +15,11 @@ import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
+import java.security.KeyFactory;
+import java.security.KeyPairGenerator;
 import java.security.SecureRandom;
-
-import javax.annotation.Nullable;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.security.spec.X509EncodedKeySpec;
 
 public class VpnModule extends ReactContextBaseJavaModule {
 
@@ -37,75 +39,95 @@ public class VpnModule extends ReactContextBaseJavaModule {
     @Override
     public String getName() { return "VpnModule"; }
 
-    // ── Key generation ────────────────────────────────────────────────
+    // ── Key generation ─────────────────────────────────────────────────
+    // Uses X25519 via Conscrypt (installed by NetShareVpnService static block)
+    // Works on all Android versions — no BouncyCastle needed
 
     @ReactMethod
     public void generateKeyPair(Promise promise) {
-        try {
-            byte[] privateKey = new byte[32];
-            new SecureRandom().nextBytes(privateKey);
-            // Clamp per RFC 7748 §5
-            privateKey[0]  &= 248;
-            privateKey[31] &= 127;
-            privateKey[31] |= 64;
+        new Thread(() -> {
+            try {
+                // Generate clamped X25519 private key
+                byte[] privateKey = new byte[32];
+                new SecureRandom().nextBytes(privateKey);
+                privateKey[0]  &= 248;
+                privateKey[31] &= 127;
+                privateKey[31] |= 64;
 
-            byte[] publicKey = derivePublicKey(privateKey);
+                byte[] publicKey = derivePublicKeyFromPrivate(privateKey);
 
-            WritableMap result = Arguments.createMap();
-            result.putString("privateKey", Base64.encodeToString(privateKey, Base64.NO_WRAP));
-            result.putString("publicKey",  Base64.encodeToString(publicKey,  Base64.NO_WRAP));
-            promise.resolve(result);
-        } catch (Exception e) {
-            Log.e(TAG, "generateKeyPair failed", e);
-            promise.reject("KEYGEN_ERROR", e.getMessage());
-        }
+                WritableMap result = Arguments.createMap();
+                result.putString("privateKey", Base64.encodeToString(privateKey, Base64.NO_WRAP));
+                result.putString("publicKey",  Base64.encodeToString(publicKey,  Base64.NO_WRAP));
+                promise.resolve(result);
+            } catch (Exception e) {
+                Log.e(TAG, "generateKeyPair failed", e);
+                promise.reject("KEYGEN_ERROR", e.getMessage());
+            }
+        }).start();
     }
 
-    private byte[] derivePublicKey(byte[] privateKey) throws Exception {
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            java.security.KeyFactory kf = java.security.KeyFactory.getInstance("XDH");
-            java.security.spec.NamedParameterSpec spec = new java.security.spec.NamedParameterSpec("X25519");
-            java.security.PrivateKey priv = kf.generatePrivate(
-                new java.security.spec.XECPrivateKeySpec(spec, privateKey.clone()));
-            byte[] basePoint = new byte[32];
-            basePoint[0] = 9;
-            java.security.PublicKey pub = kf.generatePublic(
-                new java.security.spec.XECPublicKeySpec(spec,
-                    new java.math.BigInteger(1, reverseBytes(basePoint))));
-            javax.crypto.KeyAgreement ka = javax.crypto.KeyAgreement.getInstance("XDH");
-            ka.init(priv);
-            ka.doPhase(pub, true);
-            return ka.generateSecret();
-        }
-        // Android 7-12: BouncyCastle
-        Class<?> privCls   = Class.forName("org.bouncycastle.crypto.params.X25519PrivateKeyParameters");
-        Object   privParam = privCls.getDeclaredConstructor(byte[].class, int.class).newInstance(privateKey, 0);
-        Object   pubParam  = privCls.getMethod("generatePublicKey").invoke(privParam);
-        byte[]   out       = new byte[32];
-        pubParam.getClass().getMethod("encode", byte[].class, int.class).invoke(pubParam, out, 0);
-        return out;
+    private static byte[] derivePublicKeyFromPrivate(byte[] privateKey) throws Exception {
+        // Build PKCS8 wrapper for X25519 private key
+        // ASN.1: SEQUENCE { INTEGER 0, SEQUENCE { OID 1.3.101.110 }, OCTET STRING { OCTET STRING <key> } }
+        byte[] pkcs8Prefix = new byte[]{
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+            0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20
+        };
+        byte[] pkcs8 = new byte[pkcs8Prefix.length + 32];
+        System.arraycopy(pkcs8Prefix, 0, pkcs8, 0, pkcs8Prefix.length);
+        System.arraycopy(privateKey, 0, pkcs8, pkcs8Prefix.length, 32);
+
+        KeyFactory kf = KeyFactory.getInstance("X25519");
+        java.security.PrivateKey priv = kf.generatePrivate(new PKCS8EncodedKeySpec(pkcs8));
+
+        // Extract public key from private key via KeyPair generation trick
+        // Conscrypt supports this — generate a fresh pair, then replace private key bytes
+        // Actually: use KeyPairGenerator to get a keypair, extract the public key format,
+        // then use X25519 agreement with base point to get our public key
+        // Simpler: use base point multiplication via agreement
+        byte[] basePoint = new byte[32];
+        basePoint[0] = 9;
+
+        // Build SubjectPublicKeyInfo for base point
+        byte[] spkiPrefix = new byte[]{
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+            0x6e, 0x03, 0x21, 0x00
+        };
+        byte[] spki = new byte[spkiPrefix.length + 32];
+        System.arraycopy(spkiPrefix, 0, spki, 0, spkiPrefix.length);
+        System.arraycopy(basePoint, 0, spki, spkiPrefix.length, 32);
+        java.security.PublicKey pubBasePoint = kf.generatePublic(new X509EncodedKeySpec(spki));
+
+        javax.crypto.KeyAgreement ka = javax.crypto.KeyAgreement.getInstance("X25519");
+        ka.init(priv);
+        ka.doPhase(pubBasePoint, true);
+        return ka.generateSecret();
     }
 
-    private static byte[] reverseBytes(byte[] b) {
-        byte[] r = b.clone();
-        for (int i = 0, j = r.length - 1; i < j; i++, j--) {
-            byte t = r[i]; r[i] = r[j]; r[j] = t;
-        }
-        return r;
-    }
-
-    // ── VPN permission ────────────────────────────────────────────────
+    // ── VPN permission ─────────────────────────────────────────────────
 
     @ReactMethod
     public void requestVpnPermission(Promise promise) {
         try {
-            Intent intent = VpnService.prepare(getCurrentActivity());
+            android.app.Activity activity = getCurrentActivity();
+            if (activity == null) {
+                // No activity yet — check if permission already granted
+                Intent intent = VpnService.prepare(reactContext);
+                if (intent == null) {
+                    promise.resolve(true);
+                } else {
+                    promise.reject("NO_ACTIVITY", "No foreground activity to show VPN permission dialog");
+                }
+                return;
+            }
+            Intent intent = VpnService.prepare(activity);
             if (intent == null) {
                 promise.resolve(true);
                 return;
             }
             vpnPermissionPromise = promise;
-            getCurrentActivity().startActivityForResult(intent, VPN_REQUEST_CODE);
+            activity.startActivityForResult(intent, VPN_REQUEST_CODE);
         } catch (Exception e) {
             promise.reject("PERMISSION_ERROR", e.getMessage());
         }
@@ -117,7 +139,7 @@ public class VpnModule extends ReactContextBaseJavaModule {
         vpnPermissionPromise = null;
     }
 
-    // ── Start / Stop VPN ──────────────────────────────────────────────
+    // ── Start / Stop VPN ───────────────────────────────────────────────
 
     @ReactMethod
     public void startVpn(ReadableMap config, Promise promise) {
@@ -169,7 +191,7 @@ public class VpnModule extends ReactContextBaseJavaModule {
         }
     }
 
-    // ── Stats & Debug ─────────────────────────────────────────────────
+    // ── Stats & Debug ──────────────────────────────────────────────────
 
     @ReactMethod
     public void getBandwidthStats(Promise promise) {
@@ -194,12 +216,12 @@ public class VpnModule extends ReactContextBaseJavaModule {
         promise.resolve(NetShareVpnService.getDebugLog());
     }
 
-    // ── Event emitter ─────────────────────────────────────────────────
+    // ── Event emitter ──────────────────────────────────────────────────
 
     static void emitEvent(String name, String data) {
         try {
             ReactApplicationContext ctx = _staticContext;
-            if (ctx == null) return;
+            if (ctx == null || !ctx.hasActiveReactInstance()) return;
             WritableMap params = Arguments.createMap();
             params.putString("data", data);
             ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
